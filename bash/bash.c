@@ -2692,6 +2692,7 @@ static void _bash_vars_free(bash_vars_t *v)
 #endif
 static void _bash_dbg_log(const char *fmt, ...)
 {
+#if 0 // DEBUG_LOG
     FILE *fp = fopen(BASH_DBG_LOG_FNAME, "a");
     if (!fp) return;
     va_list ap; va_start(ap, fmt);
@@ -2699,6 +2700,9 @@ static void _bash_dbg_log(const char *fmt, ...)
     fputc('\n', fp);
     va_end(ap);
     fclose(fp);
+#else
+    (void)fmt; 
+#endif
 }
 /* Frame depth helper (walks up parent chain). */
 static int _bash_frame_depth(bash_ctx_t *ctx)
