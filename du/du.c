@@ -1,11 +1,12 @@
 /**
  * @file du.c
- * @brief Cross-platform du command implementation
+ * @brief Cross-platform du command implementation (GNU coreutils 9.x compatible)
  * @author Yezc
  * @note encoding utf-8
  *
  * Reimplemented in portable C99 for Windows, Linux, macOS,
  * FreeBSD, OpenBSD, NetBSD, and other Unix-like systems.
+ * Behavior is compatible with GNU coreutils du 9.x.
  *
  * Key behaviors:
  *   - -a, --all: write counts for all files, not just directories
@@ -148,7 +149,7 @@
  ********************************/
 
 /** @brief Version string */
-#define DU_VERSION_STR "v1.0.0"
+#define DU_VERSION_STR "v9.7"
 
 /** @brief Maximum path buffer length (bytes) */
 #define DU_MAX_PATH 4096
@@ -282,7 +283,9 @@ static bool _du_inode_seen(du_state_t * state, dev_t dev, ino_t ino);
 static void _du_inode_free(du_state_t * state);
 #endif
 
+#ifdef DU_PLATFORM_WINDOWS
 static bool _du_wildcard_match(const char * pattern, const char * str);
+#endif
 
 #ifdef DU_PLATFORM_WINDOWS
 static int _du_utf8_to_wide(const char * utf8, wchar_t * out, size_t out_wchars);
@@ -973,6 +976,7 @@ static uint64_t _du_get_size(const char * path, const du_stat_t * st,
 #endif
 }
 
+#ifdef DU_PLATFORM_WINDOWS
 /**
  * @brief Simple wildcard matcher (supports * and ?).
  *
@@ -1023,6 +1027,7 @@ static bool _du_wildcard_match(const char * pattern, const char * str)
     }
     return (*str == '\0');
 }
+#endif /* DU_PLATFORM_WINDOWS */
 
 /**
  * @brief Check if a path matches any exclude pattern.
