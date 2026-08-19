@@ -1,6 +1,6 @@
 /**
  * @file cat.c
- * @brief Cross-platform cat command implementation (GNU coreutils 9.x compatible)
+ * @brief Cross-platform cat command implementation
  * @author Yezc
  * @note encoding utf-8
  *
