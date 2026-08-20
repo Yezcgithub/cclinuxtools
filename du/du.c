@@ -1,12 +1,11 @@
 /**
  * @file du.c
- * @brief Cross-platform du command implementation (GNU coreutils 9.x compatible)
+ * @brief Cross-platform du command implementation
  * @author Yezc
  * @note encoding utf-8
  *
  * Reimplemented in portable C99 for Windows, Linux, macOS,
  * FreeBSD, OpenBSD, NetBSD, and other Unix-like systems.
- * Behavior is compatible with GNU coreutils du 9.x.
  *
  * Key behaviors:
  *   - -a, --all: write counts for all files, not just directories
@@ -149,7 +148,7 @@
  ********************************/
 
 /** @brief Version string */
-#define DU_VERSION_STR "v9.7"
+#define DU_VERSION_STR "v1.0.0"
 
 /** @brief Maximum path buffer length (bytes) */
 #define DU_MAX_PATH 4096
