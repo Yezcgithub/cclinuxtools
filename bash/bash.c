@@ -653,6 +653,42 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
     if (opts->fd_stderr_to_stdout) { if (old_stderr < 0) old_stderr = BASH_DUP(2); BASH_DUP2(1, 2); }
     else if (opts->fd_stderr >= 0) { old_stderr = BASH_DUP(2); BASH_DUP2(opts->fd_stderr, 2); }
 
+    /* Before spawning child on native console: temporarily clear
+     * DISABLE_NEWLINE_AUTO_RETURN so child's plain "\n" output still
+     * triggers a CR (carriage return).  Without this, external programs
+     * (touch.exe, gcc, make …) that emit pure-LF newlines render with
+     * "staircase" wrapping because the cursor never returns to column 0.
+     * We keep ENABLE_VIRTUAL_TERMINAL_PROCESSING so ANSI colours still work
+     * inside the child.  Restore our original mode after the child exits. */
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#  define ENABLE_VIRTUAL_TERMINAL_PROCESSING  0x0004
+#endif
+#ifndef DISABLE_NEWLINE_AUTO_RETURN
+#  define DISABLE_NEWLINE_AUTO_RETURN         0x0008
+#endif
+    HANDLE hcon_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD  saved_mode_out = 0;
+    int    need_restore_mode_out = 0;
+    if (hcon_out && hcon_out != INVALID_HANDLE_VALUE) {
+        DWORD cur = 0;
+        if (GetConsoleMode(hcon_out, &cur) && (cur & DISABLE_NEWLINE_AUTO_RETURN)) {
+            saved_mode_out = cur;
+            SetConsoleMode(hcon_out, cur & ~(DWORD)DISABLE_NEWLINE_AUTO_RETURN);
+            need_restore_mode_out = 1;
+        }
+    }
+    HANDLE hcon_err = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD  saved_mode_err = 0;
+    int    need_restore_mode_err = 0;
+    if (hcon_err && hcon_err != INVALID_HANDLE_VALUE && hcon_err != hcon_out) {
+        DWORD cur = 0;
+        if (GetConsoleMode(hcon_err, &cur) && (cur & DISABLE_NEWLINE_AUTO_RETURN)) {
+            saved_mode_err = cur;
+            SetConsoleMode(hcon_err, cur & ~(DWORD)DISABLE_NEWLINE_AUTO_RETURN);
+            need_restore_mode_err = 1;
+        }
+    }
+
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
@@ -682,9 +718,20 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
     if (old_stderr >= 0) { BASH_DUP2(old_stderr, 2); BASH_CLOSE(old_stderr); }
     bash_bstr_free(&cmdline);
 
-    if (!ok) return -1;
+    if (!ok) {
+        /* child failed to start — still restore our console mode before returning */
+        if (need_restore_mode_out && hcon_out && hcon_out != INVALID_HANDLE_VALUE)
+            SetConsoleMode(hcon_out, saved_mode_out);
+        if (need_restore_mode_err && hcon_err && hcon_err != INVALID_HANDLE_VALUE)
+            SetConsoleMode(hcon_err, saved_mode_err);
+        return -1;
+    }
     if (out_pid) *out_pid = (int)pi.dwProcessId;
     if (opts->background) {
+        /* Background child inherits the non-DISABLE_NEWLINE_AUTO_RETURN mode,
+         * which is fine — most background tools expect normal LF semantics.
+         * We don't try to restore mode for a background process because the
+         * child is still running and would race against our SetConsoleMode. */
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         return 0;
@@ -694,6 +741,14 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
     GetExitCodeProcess(pi.hProcess, &rc);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    /* child is done — restore bash's preferred console mode (with
+     * DISABLE_NEWLINE_AUTO_RETURN so the built-in line editor keeps
+     * precise cursor control for redraws / CJK column accounting). */
+    if (need_restore_mode_out && hcon_out && hcon_out != INVALID_HANDLE_VALUE)
+        SetConsoleMode(hcon_out, saved_mode_out);
+    if (need_restore_mode_err && hcon_err && hcon_err != INVALID_HANDLE_VALUE)
+        SetConsoleMode(hcon_err, saved_mode_err);
     return (int)rc;
 
 #else /* POSIX */
@@ -4249,13 +4304,32 @@ static int bi_shift(bash_ctx_t *ctx, int argc, char **argv)
     bash_frame_t *f = ctx->frame;
     while (f && !f->is_func) f = f->parent;
     if (!f) return 0;
-    if (n > f->argc - 1) return 1;
-    for (int i = 1; i + n < f->argc; i++) {
+    if (n < 1) n = 1;
+    /* Nothing to shift past available positional params (argv[0] is script/func
+     * name, positional params occupy argv[1..argc-1]) */
+    int nargs = f->argc - 1;               /* number of positional params */
+    if (n > nargs) return 1;                /* GNU shift returns 1 on N>$# */
+    if (nargs == 0) { f->argc = 1; return 0; }
+
+    /* Free only the argv[1..n] slots that are being removed. Then shift the
+     * remaining pointer entries (argv[1+n .. argc-1]) left by n positions
+     * using memmove. The moved char* pointers still point at their original
+     * allocations — no alias is introduced, so the frame-pop free loop won't
+     * double-free (the old broken code freed slots mid-move, creating aliases
+     * that were then freed a second time both in-loop and on pop). */
+    for (int i = 1; i <= n; i++) {
         free(f->argv[i]);
-        f->argv[i] = f->argv[i + n];
+        f->argv[i] = NULL;
     }
-    for (int i = (f->argc > n) ? (f->argc - n) : 0; i < f->argc; i++) f->argv[i] = NULL;
-    f->argc = (f->argc > n) ? (f->argc - n) : 1;
+    int nkeep = nargs - n;                 /* positional params remaining */
+    if (nkeep > 0) {
+        memmove(&f->argv[1], &f->argv[1 + n], sizeof(char *) * (size_t)nkeep);
+    }
+    /* NULL out the trailing slots that were vacated */
+    for (int i = 1 + nkeep; i < f->argc; i++) {
+        f->argv[i] = NULL;
+    }
+    f->argc = 1 + nkeep;
     if (f->argc < 1) f->argc = 1;
     return 0;
 }
@@ -6249,10 +6323,19 @@ static char **_bash_complete(bash_ctx_t *ctx, const char *token, int token_len,
             if (strncmp(f->name, pre_s, pre_len) == 0)
                 bash_barray_push(&out, _bash_xstrdup(f->name));
         }
-        /* 3) self dir + PATH directories: list executables matching pre */
+        /* 3) self dir + cmdtools subdir + PATH directories: list executables matching pre */
         bash_barray_t dirs; bash_barray_init(&dirs);
         char *sd = _bash_get_self_dir();
         if (sd && *sd) bash_barray_push(&dirs, _bash_xstrdup(sd));
+        /* 3b) <self dir>/cmdtools — companion commands shipped alongside bash */
+        if (sd && *sd) {
+            bash_bstr_t cb; bash_bstr_init(&cb);
+            bash_bstr_puts(&cb, sd);
+            size_t cl = cb.len;
+            if (cl == 0 || cb.data[cl-1] != BASH_SEP) bash_bstr_putc(&cb, BASH_SEP);
+            bash_bstr_puts(&cb, BASH_CMD_SUBDIR);
+            bash_barray_push(&dirs, cb.data);
+        }
         const char *path_env = getenv("PATH");
         if (path_env) {
             const char *p = path_env;
@@ -8268,6 +8351,9 @@ int main(int argc, char **argv)
                 } \
                 _bash_complete_free(aa, nn); printf("\n"); \
             } while (0)
+            TC("tou");           /* command: expect touch.exe from cmdtools/ */
+            TC("ech");           /* command: expect echo (builtin) */
+            TC("pwd ");          /* command arg: expect files (pwd + space) */
             TC("cd l1/l");
             TC("cd l1/l2/l");
             TC("cd l1/l2/l3");
