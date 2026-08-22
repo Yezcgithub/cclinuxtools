@@ -86,21 +86,27 @@
 #else
     #define BASH_PLATFORM_POSIX   1
 #endif
-/* POSIX feature macros - must be defined before including any headers */
+/* POSIX feature macros - must be defined before including any headers.
+ * Per project rules: force macros with #undef -> #define pattern so they
+ * always take effect regardless of what the compiler or user's CFLAGS
+ * pre-defined. */
 #ifdef BASH_PLATFORM_LINUX
-    #ifndef _POSIX_C_SOURCE
-        #define _POSIX_C_SOURCE 200809L
-    #endif
+    #undef  _POSIX_C_SOURCE
+    #define _POSIX_C_SOURCE 200809L
+    #undef  _XOPEN_SOURCE
+    #define _XOPEN_SOURCE   700
+    #undef  _DEFAULT_SOURCE
+    #define _DEFAULT_SOURCE 1
+    #undef  _GNU_SOURCE
+    #define _GNU_SOURCE     1
 #endif
 #ifdef BASH_PLATFORM_MACOS
-    #ifndef _DARWIN_C_SOURCE
-        #define _DARWIN_C_SOURCE
-    #endif
+    #undef  _DARWIN_C_SOURCE
+    #define _DARWIN_C_SOURCE 1
 #endif
 #ifdef BASH_PLATFORM_NETBSD
-    #ifndef _NETBSD_SOURCE
-        #define _NETBSD_SOURCE
-    #endif
+    #undef  _NETBSD_SOURCE
+    #define _NETBSD_SOURCE 1
 #endif
 
 /********************************
@@ -196,6 +202,10 @@ static void _bash_sync_stdhandles(void)
     #include <time.h>
     #include <libgen.h>
     #include <termios.h>
+#include <wchar.h>
+#include <locale.h>
+#include <langinfo.h>
+#include <iconv.h>
     #define BASH_STRDUP            strdup
     #define BASH_GETCWD            getcwd
     #define BASH_CHDIR             chdir
@@ -318,12 +328,25 @@ static int    _bash_waitpid(int pid);
 
 /** @brief Formatted print to stderr (fprintf-compatible). */
 #ifndef bash_err_printf
-    #define bash_err_printf(fmt, ...) fprintf(bash_err_stream, fmt, ##__VA_ARGS__)
+    #define bash_err_printf(fmt, ...) bash_fprintf_impl(bash_err_stream, fmt, ##__VA_ARGS__)
 #endif
 
-/** @brief Write a NUL-terminated string to a stdio stream. */
+/** @brief Write a NUL-terminated string to a stdio stream.
+ *  When writing to the interactive console streams (stdout / stderr) the
+ *  string is automatically re-encoded from internal UTF-8 to whatever
+ *  host code page the console is currently using; file/pipe sinks are
+ *  written raw UTF-8 to match modern GNU bash behaviour. */
 #ifndef bash_fputs
-    #define bash_fputs(str, stream) (void)fputs((str), (stream))
+    #define bash_fputs(str, stream) (void)bash_fputs_impl((str), (stream))
+#endif
+
+/** @brief Formatted print to a stdio stream (fprintf-compatible).
+ *  Formatting result is composed in a local buffer as UTF-8, then passed
+ *  through bash_fputs_impl() so interactive-console re-encoding is applied
+ *  exactly once to the fully-rendered message (including any %s args that
+ *  may be user-supplied UTF-8 strings like "你好" or "新建文件夹"). */
+#ifndef bash_fprintf
+    #define bash_fprintf(stream, fmt, ...) (void)bash_fprintf_impl((stream), (fmt), ##__VA_ARGS__)
 #endif
 
 /** @brief Flush a stdio stream output buffer. */
@@ -340,6 +363,384 @@ static int    _bash_waitpid(int pid);
  *    static variables
  ********************************/
 
+/* =========================================================================
+ * Encoding Intermediate Layer — bash↔system boundary codec
+ * -------------------------------------------------------------------------
+ *  RULE: bash internal strings (vars, script body, prompt expansion, ...)
+ *        are ALWAYS UTF-8 byte strings.  Any string that crosses the
+ *        boundary between "inside the shell" and "host OS / console /
+ *        child process / CRT environment" is converted here.
+ *
+ *  Windows: auto-detect GetConsoleCP() (input) / GetConsoleOutputCP()
+ *           (output) when attached to a real console, else fall back to
+ *           GetACP().  We NO LONGER force CP_UTF8 on the user's console
+ *           — instead we translate ourselves, which is the "middle layer"
+ *           the user asked for.  Conversion uses MB2WC/WC2MB round-trip
+ *           through UTF-16 WCHARs.
+ *
+ *  POSIX:   initialise locale with setlocale(LC_ALL,"") and read the
+ *           nl_langinfo(CODESET).  For a UTF-8 locale (the common case
+ *           on modern Linux / macOS) every encoder is a no-op strdup,
+ *           so overhead is negligible.  Non-UTF-8 locales use iconv(3).
+ * ========================================================================= */
+#ifdef BASH_PLATFORM_WINDOWS
+static DWORD g_enc_cp_in        = CP_ACP;
+static DWORD g_enc_cp_out       = CP_ACP;
+static int   g_enc_in_is_utf8   = 0;
+static int   g_enc_out_is_utf8  = 0;
+#else
+static iconv_t g_ic_s2u = (iconv_t)-1;   /* host locale  -> UTF-8  */
+static iconv_t g_ic_u2s = (iconv_t)-1;   /* UTF-8       -> host locale */
+static int     g_is_utf8_locale = 1;
+#endif
+
+/* ASCII fast-path: if a string contains no byte >= 0x80, any codec that is
+ * a superset of ASCII (GBK, Shift-JIS, ISO-8859-x, UTF-8, ...) will map it
+ * byte-for-byte identical, so we can safely skip the real codec and just
+ * strdup.  This covers ~100% of shell prompts, builtin help output, option
+ * flags, variable names, test output, etc. */
+static int enc_is_ascii(const char *s)
+{
+    if (!s) return 1;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p & 0x80) return 0;
+    return 1;
+}
+
+static void enc_init(void)
+{
+#ifdef BASH_PLATFORM_WINDOWS
+    HANDLE ho = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hi = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD  dummy;
+    UINT   acp        = GetACP();
+    UINT   con_cp_in  = GetConsoleCP();        /* works even with redirected stdio, returns 0 if truly no console subsystem */
+    UINT   con_cp_out = GetConsoleOutputCP();  /* (ditto) reflects user's chcp NNNN 鈥?the page cmd.exe actually displays */
+    int    hi_con     = (hi && hi != INVALID_HANDLE_VALUE && GetConsoleMode(hi, &dummy));
+    int    ho_con     = (ho && ho != INVALID_HANDLE_VALUE && GetConsoleMode(ho, &dummy));
+    /* 1) mintty/MSYS2/Cygwin — byte-stream pty, always UTF-8.
+     *    ONLY trust POSITIVE mintty-specific markers.  TERM=xterm is
+     *    LEAKED by VSCode, ConEmu and Git-for-Windows into plain cmd.exe
+     *    sessions that still use chcp 936 (GBK).  Relying on TERM used
+     *    to cause enc_utf8_to_sys() to short-circuit, making every
+     *    stderr message mojibake ("浣犲ソ" instead of "你好").           */
+    int force_utf8 = 0;
+    if (getenv("MSYSTEM"))                  force_utf8 = 1;
+    if (getenv("MINTTY_VERSION"))           force_utf8 = 1;
+    if (force_utf8) {
+        g_enc_cp_in  = CP_UTF8;
+        g_enc_cp_out = CP_UTF8;
+    } else {
+        /* 2) real console handle 鈫?trust specific handle
+         * 3) no real console but GetConsoleCP/OutputCP report something
+         *    non-zero (user did `chcp 65001` in the parent cmd) 鈫?prefer
+         *    that over the global ACP, which is stale for byte-streams
+         * 4) last resort 鈫?the system-wide ACP                                 */
+        g_enc_cp_in  = hi_con
+                       ? con_cp_in
+                       : (con_cp_in  ? con_cp_in  : acp);
+        g_enc_cp_out = ho_con
+                       ? con_cp_out
+                       : (con_cp_out ? con_cp_out : acp);
+        if (!g_enc_cp_in)  g_enc_cp_in  = acp;
+        if (!g_enc_cp_out) g_enc_cp_out = acp;
+    }
+    g_enc_in_is_utf8  = (g_enc_cp_in  == CP_UTF8);
+    g_enc_out_is_utf8 = (g_enc_cp_out == CP_UTF8);
+#else
+    setlocale(LC_ALL, "");
+    const char *cs = nl_langinfo(CODESET);
+    g_is_utf8_locale = (cs && (
+        !strcasecmp(cs, "UTF-8") || !strcasecmp(cs, "UTF8") ||
+        !strcasecmp(cs, "utf-8") || !strcasecmp(cs, "utf8")));
+    if (!g_is_utf8_locale && cs && *cs) {
+        g_ic_s2u = iconv_open("UTF-8", cs);
+        g_ic_u2s = iconv_open(cs, "UTF-8");
+    }
+#endif
+}
+
+static char *enc_sys_to_utf8(const char *sys)
+{
+    if (!sys) return NULL;
+    if (!*sys) return _bash_xstrdup("");
+    if (enc_is_ascii(sys)) return _bash_xstrdup(sys);
+#ifdef BASH_PLATFORM_WINDOWS
+    if (g_enc_in_is_utf8) return _bash_xstrdup(sys);
+    int nw = MultiByteToWideChar(g_enc_cp_in, 0, sys, -1, NULL, 0);
+    if (nw <= 0) return _bash_xstrdup(sys);
+    wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+    MultiByteToWideChar(g_enc_cp_in, 0, sys, -1, w, nw);
+    int nu = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = (char *)_bash_xmalloc(nu <= 0 ? 1 : (size_t)nu);
+    if (nu > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, u, nu, NULL, NULL);
+    else u[0] = 0;
+    free(w);
+    return u;
+#else
+    if (g_is_utf8_locale || g_ic_s2u == (iconv_t)-1) return _bash_xstrdup(sys);
+    size_t inl = strlen(sys), outl = inl * 4 + 8;
+    char *out = (char *)_bash_xmalloc(outl + 1);
+    char *pi  = (char *)sys;
+    char *po  = out;
+    size_t av = outl;
+    if (iconv(g_ic_s2u, &pi, &inl, &po, &av) == (size_t)-1) {
+        free(out);
+        return _bash_xstrdup(sys);
+    }
+    *po = 0;
+    return out;
+#endif
+}
+
+static char *enc_utf8_to_sys(const char *utf8)
+{
+    if (!utf8) return NULL;
+    if (!*utf8) return _bash_xstrdup("");
+    if (enc_is_ascii(utf8)) return _bash_xstrdup(utf8);
+#ifdef BASH_PLATFORM_WINDOWS
+    if (g_enc_out_is_utf8) return _bash_xstrdup(utf8);
+    int nw = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (nw <= 0) return _bash_xstrdup(utf8);
+    wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, nw);
+    int ns = WideCharToMultiByte(g_enc_cp_out, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s = (char *)_bash_xmalloc(ns <= 0 ? 1 : (size_t)ns);
+    if (ns > 0) WideCharToMultiByte(g_enc_cp_out, 0, w, -1, s, ns, NULL, NULL);
+    else s[0] = 0;
+    free(w);
+    return s;
+#else
+    if (g_is_utf8_locale || g_ic_u2s == (iconv_t)-1) return _bash_xstrdup(utf8);
+    size_t inl = strlen(utf8), outl = inl * 6 + 8;
+    char *out = (char *)_bash_xmalloc(outl + 1);
+    char *pi  = (char *)utf8;
+    char *po  = out;
+    size_t av = outl;
+    if (iconv(g_ic_u2s, &pi, &inl, &po, &av) == (size_t)-1) {
+        free(out);
+        return _bash_xstrdup(utf8);
+    }
+    *po = 0;
+    return out;
+#endif
+}
+
+/* Short aliases used at call sites.  "UP" = native -> Utf-8 (input side).
+ * "PU" = Utf-8 -> native (output side).  Caller frees with enc_free or free(). */
+#define ENC_UP(str)  enc_sys_to_utf8((str))
+#define ENC_PU(str)  enc_utf8_to_sys((str))
+static void enc_free(void *p) { if (p) free(p); }
+
+/* --------------------- stdout/stderr I/O wrappers ---------------------
+ * bash_fputs_impl() is called for every user-facing string that would
+ * otherwise go through fputs() directly.  UTF-8 -> host encoding
+ * conversion is applied ONLY when the destination is a real interactive
+ * console / TTY 鈥?detected via _isatty() on POSIX / _isatty + Windows
+ * GetFileType() for the underlying C file descriptor.
+ *
+ * The previous implementation incorrectly compared `stream == stdout`
+ * to decide whether to transcode; after `echo x > f` the FILE* pointer
+ * is still named `stdout` yet the underlying handle is a disk file, so
+ * UTF-8 text was wrongly re-encoded to GBK before being written to
+ * disk files, corrupting redirected output (CA-C7-BF-EC-... GBK bytes
+ * ended up in .txt files instead of clean UTF-8 E6-98-AF-...).
+ *
+ * Today we look at the *handle* nature.  Redirected files, pipes,
+ * subshell capture and mintty/MSYS2 byte-streams all receive raw
+ * UTF-8 鈥?which is the modern GNU bash default.                    */
+static int _bash_stream_is_real_console(FILE *stream)
+{
+    if (!stream) return 0;
+#ifdef BASH_PLATFORM_WINDOWS
+    int fd = _fileno(stream);
+    if (fd < 0) return 0;
+    intptr_t fh = _get_osfhandle(fd);
+    if (fh == -1 || fh == 0) return 0;
+    HANDLE h = (HANDLE)fh;
+    DWORD  dummy;
+    int r_iscon = GetConsoleMode(h, &dummy);
+    DWORD ft = GetFileType(h);
+
+    if (r_iscon) return 1;
+    if (ft == FILE_TYPE_CHAR) return 1;
+    return 0;
+#else
+    return (isatty(fileno(stream)) != 0);
+#endif
+}
+static int bash_fputs_impl(const char *s, FILE *stream)
+{
+    if (!s) return EOF;
+    if (!*s) { return 0; }
+    if (!_bash_stream_is_real_console(stream)) {
+        /* Redirected file, pipe, mintty pty, subshell capture —
+         * all of these expect raw UTF-8 bytes on the wire.         */
+        return fputs(s, stream);
+    }
+    if (enc_is_ascii(s)) {
+        return fputs(s, stream);
+    }
+#ifdef BASH_PLATFORM_WINDOWS
+    /* ROOT FIX: Do NOT call enc_utf8_to_sys() — that function short-
+     * circuits when g_enc_out_is_utf8==1, which was previously forced
+     * by TERM=xterm leakage.  Instead call GetConsoleOutputCP()
+     * DIRECTLY and transcode UTF-8 -> whatever the real console is
+     * actually using (typically 936 = GBK on Chinese Windows cmd).
+     * This way even if env vars are polluted we still display "你好"
+     * correctly instead of mojibake "浣犲ソ".                        */
+    UINT cc = GetConsoleOutputCP();
+    if (!cc) cc = GetACP();
+    if (cc == CP_UTF8) {
+        return fputs(s, stream);
+    }
+    int nw = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (nw <= 0) return fputs(s, stream);
+    wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, nw);
+    int ns = WideCharToMultiByte(cc, 0, w, -1, NULL, 0, NULL, NULL);
+    char *native = (char *)_bash_xmalloc(ns <= 0 ? 1 : (size_t)ns);
+    if (ns > 0) WideCharToMultiByte(cc, 0, w, -1, native, ns, NULL, NULL);
+    else native[0] = 0;
+    free(w);
+    int rc2 = fputs(native, stream);
+    free(native);
+    return rc2;
+#else
+    char *native = enc_utf8_to_sys(s);
+    int   rc     = fputs(native ? native : s, stream);
+    enc_free(native);
+    return rc;
+#endif
+}
+
+/** @brief Formatted print to a stdio stream — impl for bash_fprintf macro.
+ *  Composes the final message in a scratch buffer as pure UTF-8 (so that
+ *  any %s argument — including user input like "你好" or "新建文件夹" —
+ *  is treated as canonical internal UTF-8), then hands the finished
+ *  string to bash_fputs_impl() EXACTLY ONCE.  This avoids double-encode
+ *  bugs and guarantees every user-facing stderr message is transcoded
+ *  consistently, regardless of which function emits it.              */
+static int bash_fprintf_impl(FILE *stream, const char *fmt, ...)
+{
+    char    stackbuf[1024];
+    char   *buf = stackbuf;
+    va_list ap1, ap2;
+    va_start(ap1, fmt);
+    va_copy(ap2, ap1);
+    int need = vsnprintf(stackbuf, sizeof(stackbuf), fmt, ap1);
+    va_end(ap1);
+    if (need < 0) { buf = NULL; }
+    else if ((size_t)need >= sizeof(stackbuf)) {
+        buf = (char *)_bash_xmalloc((size_t)need + 1);
+        vsnprintf(buf, (size_t)need + 1, fmt, ap2);
+    }
+    va_end(ap2);
+    int rc = 0;
+    if (buf) {
+        rc = bash_fputs_impl(buf, stream);
+    }
+    if (buf != stackbuf) free(buf);
+    return rc;
+}
+
+/** @brief Convert an internal UTF-8 path string to the Windows ACP
+ *  encoding required by _chdir / _wfopen (ACP variant) / _access /
+ *  CreateFileA / etc.  Unlike enc_utf8_to_sys(), this function ALWAYS
+ *  transcodes via GetACP() DIRECTLY, regardless of g_enc_out_is_utf8
+ *  or TERM pollution.  Without this, `cd 新建文件夹` would pass raw
+ *  UTF-8 E6-96-B0-... bytes to _chdir() on a GBK system and receive
+ *  "Invalid argument" because GBK expects CF-C2-BD-A8-... instead.
+ *  On POSIX systems we simply return a dup of the input since paths
+ *  are already expected to be in user locale (UTF-8 on modern systems).
+ *  Caller frees the returned pointer with free().                      */
+static char *bash_sys_path(const char *utf8_path)
+{
+    if (!utf8_path) utf8_path = "";
+#ifdef BASH_PLATFORM_WINDOWS
+    if (enc_is_ascii(utf8_path)) return _bash_xstrdup(utf8_path);
+    UINT acp = GetACP();
+    if (acp == CP_UTF8) return _bash_xstrdup(utf8_path);
+    int nw = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, NULL, 0);
+    if (nw <= 0) return _bash_xstrdup(utf8_path);
+    wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, w, nw);
+    int ns = WideCharToMultiByte(acp, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s = (char *)_bash_xmalloc(ns <= 0 ? 1 : (size_t)ns);
+    if (ns > 0) WideCharToMultiByte(acp, 0, w, -1, s, ns, NULL, NULL);
+    else s[0] = 0;
+    free(w);
+    return s;
+#else
+    return _bash_xstrdup(utf8_path);
+#endif
+}
+
+#ifdef BASH_PLATFORM_WINDOWS
+/* @brief Wrapper around the CRT _getcwd() that transcodes the returned
+ *        path from Windows ACP (e.g. 936 = GBK) back to the shell's
+ *        internal UTF-8 representation.
+ *
+ *  Without this step, `pwd`/`cd`/`pushd`/`popd` all display Chinese
+ *  directory names using raw GBK bytes — which the rest of the shell
+ *  then incorrectly interprets as UTF-8, producing mojibake like
+ *  "ÐÂ½¨ÎÄ¼þ¼Ð" instead of the correct UTF-8 rendering of
+ *  "新建文件夹".  See also the inverse wrapper bash_sys_path() that
+ *  is used *before* calling _chdir()/_mkdir()/_access()/etc.          */
+#undef  BASH_GETCWD
+static char *_bash_getcwd_u8(char *buf, size_t size)
+{
+    char   tmp[4096];
+    char  *res = _getcwd(tmp, sizeof(tmp));
+    size_t have;
+
+    if (!res) return NULL;
+    /* _getcwd() ALWAYS returns bytes in the system ACP (e.g. 936/GBK),
+     * regardless of g_enc_cp_in (which may be CP_UTF8 when the console
+     * was chcp'd to 65001).  enc_sys_to_utf8() short-circuits when
+     * g_enc_in_is_utf8==1, leaving GBK bytes untouched and corrupting
+     * pwd/cd/pushd output.  Convert DIRECTLY via GetACP() to bypass
+     * that short-circuit.                                                  */
+    UINT acp = GetACP();
+    char *u = NULL;
+    if (acp != CP_UTF8) {
+        int nw = MultiByteToWideChar(acp, 0, res, -1, NULL, 0);
+        if (nw > 0) {
+            wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+            MultiByteToWideChar(acp, 0, res, -1, w, nw);
+            int nu = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+            if (nu > 0) {
+                u = (char *)_bash_xmalloc((size_t)nu);
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, u, nu, NULL, NULL);
+            }
+            free(w);
+        }
+    }
+    if (!u) {
+        /* ACP is already UTF-8, or conversion failed — raw bytes. */
+        have = strlen(res) + 1;
+        if (buf) {
+            if (have > size) have = size;
+            memcpy(buf, res, have - 1);
+            buf[have - 1] = 0;
+            return buf;
+        }
+        return _bash_xstrdup(res);
+    }
+    have = strlen(u) + 1;
+    if (buf) {
+        if (have > size) have = size;
+        memcpy(buf, u, have - 1);
+        buf[have - 1] = 0;
+        free(u);
+        return buf;
+    }
+    /* buf == NULL: return heap copy to match getcwd(NULL, 0) semantics. */
+    return u;
+}
+#define BASH_GETCWD _bash_getcwd_u8
+#endif  /* BASH_PLATFORM_WINDOWS */
+
 /********************************
  *    global functions
  ********************************/
@@ -351,13 +752,13 @@ static int    _bash_waitpid(int pid);
 static void *_bash_xmalloc(size_t n)
 {
     void *p = malloc(n ? n : 1);
-    if (!p) { fprintf(stderr, "bash: out of memory\n"); exit(1); }
+    if (!p) { bash_fprintf(stderr, "bash: out of memory\n"); exit(1); }
     return p;
 }
 static void *_bash_xrealloc(void *p, size_t n)
 {
     void *q = realloc(p, n ? n : 1);
-    if (!q) { fprintf(stderr, "bash: out of memory\n"); exit(1); }
+    if (!q) { bash_fprintf(stderr, "bash: out of memory\n"); exit(1); }
     return q;
 }
 static char *_bash_xstrdup(const char *s)
@@ -430,8 +831,25 @@ static char **bash_barray_detach(bash_barray_t *a){ /* appends NULL */ bash_barr
 static int _bash_is_executable(const char *path)
 {
     struct BASH_STAT st;
-    if (BASH_STAT(path, &st) != 0) return 0;
-    if (!(st.st_mode & BASH_S_IFREG)) return 0; /* not regular file */
+#ifdef BASH_PLATFORM_WINDOWS
+    /* _stat() is ANSI-only; UTF-8 paths with CJK bytes (e.g. "你好.exe")
+     * are misinterpreted as ACP (GBK) and never match.  Use GetFileAttributesW
+     * for the existence/dir check, then fall through to extension logic. */
+    if (!enc_is_ascii(path)) {
+        int nw = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        if (nw <= 0) return 0;
+        wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, w, nw);
+        DWORD attr = GetFileAttributesW(w);
+        free(w);
+        if (attr == INVALID_FILE_ATTRIBUTES) return 0;
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) return 0; /* not regular file */
+    } else
+#endif
+    {
+        if (BASH_STAT(path, &st) != 0) return 0;
+        if (!(st.st_mode & BASH_S_IFREG)) return 0; /* not regular file */
+    }
 #ifdef BASH_PLATFORM_WINDOWS
     const char *ext = strrchr(path, '.');
     if (ext) {
@@ -454,8 +872,28 @@ static int _bash_is_executable(const char *path)
 static int _bash_classify_file(const char *path)
 {
     struct BASH_STAT st;
+#ifdef BASH_PLATFORM_WINDOWS
+    int is_regular = 0;
+    if (!enc_is_ascii(path)) {
+        int nw = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        if (nw <= 0) return 0;
+        wchar_t *w = (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t));
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, w, nw);
+        DWORD attr = GetFileAttributesW(w);
+        free(w);
+        if (attr == INVALID_FILE_ATTRIBUTES) return 0;
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) return 0;
+        is_regular = 1;
+    } else {
+        if (BASH_STAT(path, &st) != 0) return 0;
+        if (!(st.st_mode & BASH_S_IFREG)) return 0;
+        is_regular = 1;
+    }
+    if (!is_regular) return 0;
+#else
     if (BASH_STAT(path, &st) != 0) return 0;
     if (!(st.st_mode & BASH_S_IFREG)) return 0;
+#endif
     if (_bash_is_executable(path)) {
 #ifdef BASH_PLATFORM_WINDOWS
         const char *ext = strrchr(path, '.');
@@ -474,7 +912,17 @@ static int _bash_classify_file(const char *path)
     if ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0) return 2; /* +x but non-binary fallback */
 #endif
     /* Read first bytes to detect shebang or text */
-    FILE *fp = fopen(path, "rb");
+    FILE *fp;
+#ifdef BASH_PLATFORM_WINDOWS
+    if (!enc_is_ascii(path)) {
+        int nw = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        wchar_t *w = (nw > 0) ? (wchar_t *)_bash_xmalloc((size_t)nw * sizeof(wchar_t)) : NULL;
+        if (w) MultiByteToWideChar(CP_UTF8, 0, path, -1, w, nw);
+        fp = w ? _wfopen(w, L"rb") : NULL;
+        free(w);
+    } else
+#endif
+        fp = fopen(path, "rb");
     if (!fp) return 0;
     unsigned char hdr[256];
     size_t got = fread(hdr, 1, sizeof(hdr), fp);
@@ -624,14 +1072,24 @@ typedef struct bash_spawn_opts_s {
 static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_opts_t *opts, int *out_pid)
 {
 #ifdef BASH_PLATFORM_WINDOWS
-    /* Build command line string */
+    /* Build command line string in UTF-8 (internal encoding).  We use
+     * CreateProcessW with a wide-char command line so that CJK program
+     * names (e.g. "你好.exe") and arguments are handled correctly
+     * regardless of the system ACP or console code page.  Previously
+     * CreateProcessA + enc_utf8_to_sys() was used, but enc_utf8_to_sys()
+     * short-circuits to raw UTF-8 when g_enc_out_is_utf8==1 (console
+     * CP 65001), and CreateProcessA then misinterprets those UTF-8
+     * bytes as ACP (GBK) — the program is not found.                       */
     bash_bstr_t cmdline; bash_bstr_init(&cmdline);
     bash_bstr_putc(&cmdline, '"');
     bash_bstr_puts(&cmdline, prog);
     bash_bstr_putc(&cmdline, '"');
-    for (int i = 1; argv[i]; i++) {
+
+    int argc_n = 0;
+    for (int j = 1; argv[j]; j++) argc_n++;
+    for (int i = 1; i < argc_n + 1; i++) {
+        const char *a = argv[i] ? argv[i] : "";
         bash_bstr_putc(&cmdline, ' ');
-        const char *a = argv[i];
         int need_quote = 0;
         for (const char *p = a; *p; p++) if (*p == ' ' || *p == '\t' || *p == '"' || *p == '&' || *p == '|' || *p == '<' || *p == '>') { need_quote = 1; break; }
         if (need_quote) {
@@ -689,7 +1147,7 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
         }
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
     /* Always use STARTF_USESTDHANDLES so the child inherits the current
@@ -708,9 +1166,18 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
         SetHandleInformation(si.hStdError,  HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     memset(&pi, 0, sizeof(pi));
 
-    BOOL ok = CreateProcessA(NULL, cmdline.data, NULL, NULL, TRUE,
+    /* Convert UTF-8 command line to wide string for CreateProcessW. */
+    int wcl_len = MultiByteToWideChar(CP_UTF8, 0, cmdline.data, -1, NULL, 0);
+    wchar_t *wcmdline = (wchar_t *)_bash_xmalloc((size_t)(wcl_len > 0 ? wcl_len : 1) * sizeof(wchar_t));
+    if (wcl_len > 0)
+        MultiByteToWideChar(CP_UTF8, 0, cmdline.data, -1, wcmdline, wcl_len);
+    else
+        wcmdline[0] = 0;
+
+    BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
                              opts->background ? CREATE_NEW_PROCESS_GROUP : 0,
                              NULL, NULL, &si, &pi);
+    free(wcmdline);
 
     /* restore fds immediately */
     if (old_stdin  >= 0) { BASH_DUP2(old_stdin,  0); BASH_CLOSE(old_stdin); }
@@ -760,8 +1227,19 @@ static int _bash_spawn(const char *prog, char *const argv[], const bash_spawn_op
         if (opts->fd_stdout >= 0) BASH_DUP2(opts->fd_stdout, 1);
         if (opts->fd_stderr_to_stdout) BASH_DUP2(1, 2);
         else if (opts->fd_stderr >= 0) BASH_DUP2(opts->fd_stderr, 2);
-        /* close any fds >=3 that we redirected? leave for now */
-        execvp(prog, argv);
+        /* Convert internal UTF-8 argv[] to the host locale's encoding.
+         * After execvp the memory map is replaced, so we don't need to
+         * free these — kernel reclaims everything regardless. */
+        int nargs = 0;
+        while (argv[nargs]) nargs++;
+        char **av_native = (char **)malloc(sizeof(char *) * (size_t)(nargs + 1));
+        if (!av_native) { execvp(prog, argv); _exit(127); }
+        for (int j = 0; j < nargs; j++) {
+            av_native[j] = enc_utf8_to_sys(argv[j]);
+            if (!av_native[j]) av_native[j] = (char *)argv[j];
+        }
+        av_native[nargs] = NULL;
+        execvp(av_native[0], av_native);
         _exit(127);
     }
     /* parent */
@@ -3007,13 +3485,20 @@ static int _bash_var_set(bash_ctx_t *ctx, const char *name, const char *value, i
                 /* sync to process environment so getenv() and child
                  * processes see the updated value.  We use both
                  * _putenv_s (CRT _environ) and SetEnvironmentVariableA
-                 * (Win32 block) to cover all lookup paths.           */
+                 * (Win32 block) to cover all lookup paths.
+                 * NAME/VALUE on the OS side must be in HOST encoding, not
+                 * our internal UTF-8, so re-encode here.  (Names are
+                 * always pure ASCII so we skip them in practice.)      */
 #ifdef BASH_PLATFORM_WINDOWS
                 extern int __cdecl _putenv_s(const char *, const char *);
-                _putenv_s(name, value ? value : "");
-                SetEnvironmentVariableA(name, value);
+                char *pu = enc_utf8_to_sys(value ? value : "");
+                _putenv_s(name, pu ? pu : (value ? value : ""));
+                SetEnvironmentVariableA(name, pu ? pu : value);
+                enc_free(pu);
 #else
-                setenv(name, value ? value : "", 1);
+                char *pu = enc_utf8_to_sys(value ? value : "");
+                setenv(name, pu ? pu : (value ? value : ""), 1);
+                enc_free(pu);
 #endif
             }
             return 0;
@@ -3028,10 +3513,14 @@ static int _bash_var_set(bash_ctx_t *ctx, const char *name, const char *value, i
     if (exported) {
 #ifdef BASH_PLATFORM_WINDOWS
         extern int __cdecl _putenv_s(const char *, const char *);
-        _putenv_s(name, value ? value : "");
-        SetEnvironmentVariableA(name, value);
+        char *pu2 = enc_utf8_to_sys(value ? value : "");
+        _putenv_s(name, pu2 ? pu2 : (value ? value : ""));
+        SetEnvironmentVariableA(name, pu2 ? pu2 : value);
+        enc_free(pu2);
 #else
-        setenv(name, value ? value : "", 1);
+        char *pu2 = enc_utf8_to_sys(value ? value : "");
+        setenv(name, pu2 ? pu2 : (value ? value : ""), 1);
+        enc_free(pu2);
 #endif
     }
     return 0;
@@ -3063,13 +3552,17 @@ static int _bash_var_set_local(bash_ctx_t *ctx, const char *name, const char *va
     }
     if (!ctx->frame) return -1;
     _bash_vars_set(&ctx->frame->vars, name, value, exported, readonly);
-    if (exported) {
+            if (exported) {
 #ifdef BASH_PLATFORM_WINDOWS
         extern int __cdecl _putenv_s(const char *, const char *);
-        _putenv_s(name, value ? value : "");
-        SetEnvironmentVariableA(name, value);
+        char *pu = enc_utf8_to_sys(value ? value : "");
+        _putenv_s(name, pu ? pu : (value ? value : ""));
+        SetEnvironmentVariableA(name, pu ? pu : value);
+        enc_free(pu);
 #else
-        setenv(name, value ? value : "", 1);
+        char *pu = enc_utf8_to_sys(value ? value : "");
+        setenv(name, pu ? pu : (value ? value : ""), 1);
+        enc_free(pu);
 #endif
     }
     return 0;
@@ -3470,7 +3963,7 @@ static char **_bash_expand_word(bash_ctx_t *ctx, const char *word, int quoted, i
                     if (!*val) { val = ip; _bash_var_set(ctx, name, val, 0, 0, 0); }
                     bash_bstr_puts(&cur, val);
                 } else if (op[0] == ':' && op[1] == '?') {
-                    if (!*val) { fprintf(stderr, "bash: %s: %s\n", name, *ip ? ip : "parameter null or not set"); ctx->do_exit = 1; ctx->exit_code = 1; }
+                    if (!*val) { bash_fprintf(stderr, "bash: %s: %s\n", name, *ip ? ip : "parameter null or not set"); ctx->do_exit = 1; ctx->exit_code = 1; }
                     bash_bstr_puts(&cur, val);
                 } else if (op[0] == ':' && op[1] == '+') {
                     if (*val) bash_bstr_puts(&cur, ip);
@@ -3860,7 +4353,7 @@ static int _bash_redir_apply(bash_ctx_t *ctx, bash_cmd_t *cmd, bash_redir_state_
             f = BASH_OPEN(r->target ? r->target : "", flags, (mode_t)mode);
 #endif
             if (f < 0) {
-                fprintf(stderr, "bash: cannot open %s: %s\n", r->target ? r->target : "", strerror(errno));
+                bash_fprintf(stderr, "bash: cannot open %s: %s\n", r->target ? r->target : "", strerror(errno));
                 return -1;
             }
             if (fd_target == 0) { if (st->stdin_fd < 0) st->stdin_fd = BASH_DUP(0); BASH_DUP2(f, 0); }
@@ -3909,11 +4402,13 @@ static int _bash_redir_apply(bash_ctx_t *ctx, bash_cmd_t *cmd, bash_redir_state_
             if (r->fd == 1) { if (st->stdout_fd < 0) st->stdout_fd = BASH_DUP(1); BASH_DUP2(n, 1); }
             else if (r->fd == 2) { if (st->stderr_fd < 0) st->stderr_fd = BASH_DUP(2); BASH_DUP2(n, 2); }
             else BASH_DUP2(n, r->fd);
+            _bash_sync_stdhandles();
         } else if (t == 9) {
             /* <& n */
             int n = r->target ? atoi(r->target) : 0;
             if (r->fd == 0) { if (st->stdin_fd < 0) st->stdin_fd = BASH_DUP(0); BASH_DUP2(n, 0); }
             else BASH_DUP2(n, r->fd);
+            _bash_sync_stdhandles();
         }
     }
     return 0;
@@ -3921,6 +4416,16 @@ static int _bash_redir_apply(bash_ctx_t *ctx, bash_cmd_t *cmd, bash_redir_state_
 
 static void _bash_redir_restore(bash_redir_state_t *st)
 {
+    /* Flush C-level buffers BEFORE restoring OS fds, otherwise data
+     * written via fputs(bash_fputs) to a redirected stderr/stdout is
+     * still sitting in the FILE* buffer when the underlying fd is
+     * swapped back to the original console — the bytes never reach
+     * the redirect target.  This is why `nonexist_cmd > f 2>&1`
+     * produced a 0-byte file: bash_fprintf(stderr,...) buffered the
+     * "command not found" message, then _bash_redir_restore pulled
+     * fd 2 back to the console before the buffer was drained.        */
+    fflush(stdout);
+    fflush(stderr);
     if (st->stdin_fd  >= 0) { BASH_DUP2(st->stdin_fd,  0); BASH_CLOSE(st->stdin_fd); }
     if (st->stdout_fd >= 0) { BASH_DUP2(st->stdout_fd, 1); BASH_CLOSE(st->stdout_fd); }
     if (st->stderr_fd >= 0) { BASH_DUP2(st->stderr_fd, 2); BASH_CLOSE(st->stderr_fd); }
@@ -3990,7 +4495,7 @@ static int bi_cd(bash_ctx_t *ctx, int argc, char **argv)
         /* cd - → switch to $OLDPWD and print it (like bash) */
         target = getenv("OLDPWD");
         if (!target || !*target) {
-            fprintf(stderr, "bash: cd: OLDPWD not set\n");
+            bash_fprintf(stderr, "bash: cd: OLDPWD not set\n");
             return 1;
         }
         printf("%s\n", target);
@@ -4013,11 +4518,16 @@ static int bi_cd(bash_ctx_t *ctx, int argc, char **argv)
                 /* Save old PWD before chdir */
                 const char *oldpwd = getenv("PWD");
                 if (!oldpwd) oldpwd = ctx->pwd ? ctx->pwd : ".";
-                if (BASH_CHDIR(dup) != 0) {
-                    fprintf(stderr, "bash: cd: %s: %s\n", dup, strerror(errno));
-                    free(dup);
+                /* ROOT FIX: convert internal UTF-8 path to Windows ACP
+                 * (GBK on Chinese cmd) before passing to _chdir; otherwise
+                 * raw UTF-8 bytes cause "Invalid argument" for CJK dirs. */
+                char *sysdup = bash_sys_path(dup);
+                if (BASH_CHDIR(sysdup) != 0) {
+                    bash_fprintf(stderr, "bash: cd: %s: %s\n", dup, strerror(errno));
+                    free(sysdup); free(dup);
                     return 1;
                 }
+                free(sysdup);
                 _bash_var_set(ctx, "OLDPWD", oldpwd, 1, 1, 0);
                 char buf[4096];
                 char *cwd = BASH_GETCWD(buf, sizeof(buf));
@@ -4037,10 +4547,14 @@ static int bi_cd(bash_ctx_t *ctx, int argc, char **argv)
     const char *oldpwd = getenv("PWD");
     if (!oldpwd) oldpwd = ctx->pwd ? ctx->pwd : ".";
 
-    if (BASH_CHDIR(target) != 0) {
-        fprintf(stderr, "bash: cd: %s: %s\n", target, strerror(errno));
+    /* ROOT FIX: UTF-8 -> ACP for _chdir, same reason as above. */
+    char *systarget = bash_sys_path(target);
+    if (BASH_CHDIR(systarget) != 0) {
+        bash_fprintf(stderr, "bash: cd: %s: %s\n", target, strerror(errno));
+        free(systarget);
         return 1;
     }
+    free(systarget);
     /* set OLDPWD to the directory we just left */
     _bash_var_set(ctx, "OLDPWD", oldpwd, 1, 1, 0);
     /* update PWD — normalize to forward slashes */
@@ -4059,14 +4573,25 @@ static int bi_pwd(bash_ctx_t *ctx, int argc, char **argv)
     (void)ctx; (void)argc; (void)argv;
     char buf[4096];
     char *cwd = BASH_GETCWD(buf, sizeof(buf));
-    if (cwd) { _bash_normalize_path(cwd); printf("%s\n", cwd); fflush(stdout); return 0; }
-    fprintf(stderr, "bash: pwd: %s\n", strerror(errno));
+    if (cwd) {
+        _bash_normalize_path(cwd);
+        /* Route through bash_fputs_impl() so console output is transcoded
+         * from internal UTF-8 to the real console's code page (e.g. GBK
+         * 936), while file/pipe redirects still get raw UTF-8 bytes —
+         * exactly matching the bi_echo() output contract.                */
+        bash_fputs(cwd, stdout);
+        bash_fputs("\n", stdout);
+        fflush(stdout);
+        return 0;
+    }
+    bash_fprintf(stderr, "bash: pwd: %s\n", strerror(errno));
     return 1;
 }
 
 static int bi_echo(bash_ctx_t *ctx, int argc, char **argv)
 {
     (void)ctx;
+
     int nflag = 0, eflag = 1;
     int start = 1;
     while (start < argc) {
@@ -4075,34 +4600,42 @@ static int bi_echo(bash_ctx_t *ctx, int argc, char **argv)
         else if (strcmp(argv[start], "-E") == 0) { eflag = 0; start++; }
         else break;
     }
+    /* Accumulate the whole echo output into a single bash_bstr_t using the
+     * shell's internal UTF-8.  At the very end we hand it off to
+     * bash_fputs_impl() which does the ONE-shot UTF-8 -> host-code-page
+     * conversion if stdout is the user's console (file/pipe sinks still get
+     * raw UTF-8 bytes, same as GNU bash modern default).                */
+    bash_bstr_t out; bash_bstr_init(&out);
     for (int i = start; i < argc; i++) {
-        if (i > start) putchar(' ');
+        if (i > start) bash_bstr_putc(&out, ' ');
         const char *s = argv[i];
         if (eflag) {
             for (; *s; s++) {
                 if (*s == '\\' && s[1]) {
                     s++;
                     switch (*s) {
-                        case 'n': putchar('\n'); break;
-                        case 't': putchar('\t'); break;
-                        case 'r': putchar('\r'); break;
-                        case 'a': putchar('\a'); break;
-                        case 'b': putchar('\b'); break;
-                        case 'f': putchar('\f'); break;
-                        case 'v': putchar('\v'); break;
-                        case '\\': putchar('\\'); break;
+                        case 'n': bash_bstr_putc(&out, '\n'); break;
+                        case 't': bash_bstr_putc(&out, '\t'); break;
+                        case 'r': bash_bstr_putc(&out, '\r'); break;
+                        case 'a': bash_bstr_putc(&out, '\a'); break;
+                        case 'b': bash_bstr_putc(&out, '\b'); break;
+                        case 'f': bash_bstr_putc(&out, '\f'); break;
+                        case 'v': bash_bstr_putc(&out, '\v'); break;
+                        case '\\': bash_bstr_putc(&out, '\\'); break;
                         case '0': {
                             int v = 0;
                             for (int k = 0; k < 3 && s[1] >= '0' && s[1] <= '7'; k++) { s++; v = v*8 + (*s - '0'); }
-                            putchar((char)v); break;
+                            bash_bstr_putc(&out, (char)v); break;
                         }
-                        default: putchar(*s);
+                        default: bash_bstr_putc(&out, *s);
                     }
-                } else putchar(*s);
+                } else bash_bstr_putc(&out, *s);
             }
-        } else fputs(s, stdout);
+        } else bash_bstr_puts(&out, s);
     }
-    if (!nflag) putchar('\n');
+    if (!nflag) bash_bstr_putc(&out, '\n');
+    bash_fputs(out.data, stdout);
+    bash_bstr_free(&out);
     fflush(stdout);
     return 0;
 }
@@ -4111,6 +4644,11 @@ static int bi_printf(bash_ctx_t *ctx, int argc, char **argv)
 {
     (void)ctx;
     if (argc < 2) return 0;
+    /* Whole formatted output is accumulated in a UTF-8 bash_bstr_t and
+     * written once via bash_fputs_impl().  This guarantees exactly one
+     * UTF-8 → host-encoding translation for user-facing console output,
+     * while file/pipe redirects remain raw UTF-8 bytes. */
+    bash_bstr_t out; bash_bstr_init(&out);
     const char *fmt = argv[1];
     int ai = 2;
     while (*fmt) {
@@ -4119,19 +4657,19 @@ static int bi_printf(bash_ctx_t *ctx, int argc, char **argv)
                 fmt++;
                 if (!*fmt) break;
                 switch (*fmt) {
-                    case 'n': putchar('\n'); break;
-                    case 't': putchar('\t'); break;
-                    case 'r': putchar('\r'); break;
-                    case '\\': putchar('\\'); break;
+                    case 'n': bash_bstr_putc(&out, '\n'); break;
+                    case 't': bash_bstr_putc(&out, '\t'); break;
+                    case 'r': bash_bstr_putc(&out, '\r'); break;
+                    case '\\': bash_bstr_putc(&out, '\\'); break;
                     case '0': {
                         int v=0; for(int k=0;k<3 && fmt[1]>='0'&&fmt[1]<='7';k++){fmt++;v=v*8+(*fmt-'0');}
-                        putchar((char)v); break;
+                        bash_bstr_putc(&out, (char)v); break;
                     }
-                    default: putchar(*fmt);
+                    default: bash_bstr_putc(&out, *fmt);
                 }
                 fmt++; continue;
             }
-            putchar(*fmt++); continue;
+            bash_bstr_putc(&out, *fmt++); continue;
         }
         fmt++;
         int width = 0, prec = -1, left = 0;
@@ -4145,44 +4683,46 @@ static int bi_printf(bash_ctx_t *ctx, int argc, char **argv)
             case 'd': case 'i': {
                 long v = a ? strtol(a, NULL, 0) : 0;
                 snprintf(buf, sizeof(buf), left ? "%-*ld" : "%*ld", width ? width : 1, v);
-                fputs(buf, stdout); break;
+                bash_bstr_puts(&out, buf); break;
             }
             case 'u': {
                 unsigned long v = a ? strtoul(a, NULL, 0) : 0;
                 snprintf(buf, sizeof(buf), left ? "%-*lu" : "%*lu", width ? width : 1, v);
-                fputs(buf, stdout); break;
+                bash_bstr_puts(&out, buf); break;
             }
             case 'x': {
                 unsigned long v = a ? strtoul(a, NULL, 0) : 0;
                 snprintf(buf, sizeof(buf), left ? "%-*lx" : "%*lx", width ? width : 1, v);
-                fputs(buf, stdout); break;
+                bash_bstr_puts(&out, buf); break;
             }
             case 'o': {
                 unsigned long v = a ? strtoul(a, NULL, 0) : 0;
                 snprintf(buf, sizeof(buf), left ? "%-*lo" : "%*lo", width ? width : 1, v);
-                fputs(buf, stdout); break;
+                bash_bstr_puts(&out, buf); break;
             }
             case 'f': {
                 double v = a ? atof(a) : 0;
                 if (prec < 0) prec = 6;
                 snprintf(buf, sizeof(buf), left ? "%-*.*f" : "%*.*f", width ? width : 1, prec, v);
-                fputs(buf, stdout); break;
+                bash_bstr_puts(&out, buf); break;
             }
             case 's': {
                 int l = a ? (int)strlen(a) : 0;
                 if (prec >= 0 && prec < l) l = prec;
                 int pad = width - l;
-                if (!left) while (pad-- > 0) putchar(' ');
-                fwrite(a, 1, l, stdout);
-                if (left) while (pad-- > 0) putchar(' ');
+                if (!left) while (pad-- > 0) bash_bstr_putc(&out, ' ');
+                bash_bstr_putn(&out, a ? a : "", (size_t)l);
+                if (left) while (pad-- > 0) bash_bstr_putc(&out, ' ');
                 break;
             }
-            case 'c': putchar(a ? a[0] : 0); break;
-            case '%': putchar('%'); break;
-            default: putchar('%'); putchar(conv);
+            case 'c': bash_bstr_putc(&out, a ? a[0] : 0); break;
+            case '%': bash_bstr_putc(&out, '%'); break;
+            default: bash_bstr_putc(&out, '%'); bash_bstr_putc(&out, conv);
         }
         if (conv != '%') ai++;
     }
+    bash_fputs(out.data, stdout);
+    bash_bstr_free(&out);
     fflush(stdout);
     return 0;
 }
@@ -4362,19 +4902,30 @@ static int bi_read(bash_ctx_t *ctx, int argc, char **argv)
         argv = new_argv;
     }
     if (use_readline) {
+        /* _bash_readline() already builds input as UTF-8 internally (it reads
+         * Unicode input via ReadConsoleInputW on Windows / byte fgets on POSIX
+         * and always emits UTF-8 into the returned heap buffer). */
         line_heap = _bash_readline(ctx, prompt ? prompt : "");
         if (!line_heap) return 1;
         line = line_heap;
     } else {
-        if (prompt) { fputs(prompt, stdout); fflush(stdout); }
+        if (prompt) { bash_fputs(prompt, stdout); fflush(stdout); }
         if (!fgets(line_stack, sizeof(line_stack), stdin)) return 1;
-        line = line_stack;
+        /* Native console/pipe bytes -> shell-internal UTF-8.  The line_heap
+         * pointer now owns the converted heap buffer and is freed at exit. */
+        line_heap = enc_sys_to_utf8(line_stack);
+        line = line_heap ? line_heap : line_stack;
     }
     int l = (int)strlen(line);
     while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) l--;
     char *input_copy = _bash_xstrndup(line, (size_t)l);
     (void)raw; /* -r recognized; no backslash processing performed in this simplified read */
-    const char *ifs = getenv("IFS"); if (!ifs) ifs = " \t";
+    /* IFS — if the user has set it in the host environment (rarely non-ASCII
+     * in practice) pull it through the UTF-8 decoder so custom IFS still
+     * works correctly on legacy-code-page systems. */
+    const char *ifs_sys = getenv("IFS");
+    char *ifs_u = ifs_sys ? enc_sys_to_utf8(ifs_sys) : NULL;
+    const char *ifs = ifs_u ? ifs_u : (ifs_sys ? ifs_sys : " \t");
     int wi = 0;
     const char *p = input_copy;
     int nvars = argc - start;
@@ -4398,6 +4949,7 @@ static int bi_read(bash_ctx_t *ctx, int argc, char **argv)
         _bash_var_set(ctx, argv[start + wi], "", 0, 0, 0);
         wi++;
     }
+    enc_free(ifs_u);
     free(input_copy);
     free(line_heap);
     if (argv != (char **)(0) && start < argc && strcmp(argv[start], "REPLY") == 0 && argc == start + 1) {
@@ -4595,7 +5147,7 @@ static int bi_source(bash_ctx_t *ctx, int argc, char **argv)
             if (path) { fp = fopen(path, "rb"); free(path); }
         }
     }
-    if (!fp) { fprintf(stderr, "bash: %s: No such file\n", fn); return 1; }
+    if (!fp) { bash_fprintf(stderr, "bash: %s: No such file\n", fn); return 1; }
     /* Apply positional args from source command (shift source file name away) */
     if (i + 1 < argc) {
         bash_frame_t *f = _bash_frame_push(ctx, 0);
@@ -4663,7 +5215,7 @@ static int bi_alias(bash_ctx_t *ctx, int argc, char **argv)
                 if (strcmp(ctx->aliases.items[k].name, argv[i]) == 0) { a = &ctx->aliases.items[k]; break; }
             }
             if (a) printf("alias %s='%s'\n", a->name, a->value);
-            else { fprintf(stderr, "bash: alias: %s: not found\n", argv[i]); rc = 1; }
+            else { bash_fprintf(stderr, "bash: alias: %s: not found\n", argv[i]); rc = 1; }
         }
     }
     fflush(stdout);
@@ -4672,7 +5224,7 @@ static int bi_alias(bash_ctx_t *ctx, int argc, char **argv)
 
 static int bi_unalias(bash_ctx_t *ctx, int argc, char **argv)
 {
-    if (argc < 2) { fprintf(stderr, "bash: unalias: usage: unalias name [name ...]\n"); return 1; }
+    if (argc < 2) { bash_fprintf(stderr, "bash: unalias: usage: unalias name [name ...]\n"); return 1; }
     int rc = 0;
     for (int i = 1; i < argc; i++) {
         int found = 0;
@@ -4688,7 +5240,7 @@ static int bi_unalias(bash_ctx_t *ctx, int argc, char **argv)
                 break;
             }
         }
-        if (!found) { fprintf(stderr, "bash: unalias: %s: not found\n", argv[i]); rc = 1; }
+        if (!found) { bash_fprintf(stderr, "bash: unalias: %s: not found\n", argv[i]); rc = 1; }
     }
     return rc;
 }
@@ -4758,10 +5310,16 @@ static int bi_dirs(bash_ctx_t *ctx, int argc, char **argv)
     /* print directory stack: top of stack first */
     char buf[4096];
     char *cwd = BASH_GETCWD(buf, sizeof(buf));
-    if (cwd) { _bash_normalize_path(cwd); printf("%s", cwd); }
-    for (int i = ctx->dir_stack_len - 1; i >= 0; i--)
-        printf(" %s", ctx->dir_stack[i]);
-    putchar('\n');
+    if (cwd) {
+        _bash_normalize_path(cwd);
+        /* stdout encoding wrapper — see bi_pwd() / bi_echo() for rationale */
+        bash_fputs(cwd, stdout);
+    }
+    for (int i = ctx->dir_stack_len - 1; i >= 0; i--) {
+        bash_fputs(" ", stdout);
+        bash_fputs(ctx->dir_stack[i], stdout);
+    }
+    bash_fputs("\n", stdout);
     fflush(stdout);
     return 0;
 }
@@ -4781,12 +5339,15 @@ static int bi_pushd(bash_ctx_t *ctx, int argc, char **argv)
     /* save current dir on stack (normalized to forward slashes) */
     char cwd_buf[4096];
     char *cwd = BASH_GETCWD(cwd_buf, sizeof(cwd_buf));
-    if (!cwd) { fprintf(stderr, "bash: pushd: cannot get cwd\n"); return 1; }
+    if (!cwd) { bash_fprintf(stderr, "bash: pushd: cannot get cwd\n"); return 1; }
     _bash_normalize_path(cwd);
-    if (BASH_CHDIR(target) != 0) {
-        fprintf(stderr, "bash: pushd: %s: %s\n", target, strerror(errno));
+    char *systarget = bash_sys_path(target);
+    if (BASH_CHDIR(systarget) != 0) {
+        bash_fprintf(stderr, "bash: pushd: %s: %s\n", target, strerror(errno));
+        free(systarget);
         return 1;
     }
+    free(systarget);
     if (ctx->dir_stack_len < 256) {
         ctx->dir_stack[ctx->dir_stack_len++] = _bash_xstrdup(cwd);
     }
@@ -4803,15 +5364,17 @@ static int bi_popd(bash_ctx_t *ctx, int argc, char **argv)
 {
     (void)argc; (void)argv;
     if (ctx->dir_stack_len == 0) {
-        fprintf(stderr, "bash: popd: directory stack empty\n");
+        bash_fprintf(stderr, "bash: popd: directory stack empty\n");
         return 1;
     }
     char *target = ctx->dir_stack[--ctx->dir_stack_len];
-    if (BASH_CHDIR(target) != 0) {
-        fprintf(stderr, "bash: popd: %s: %s\n", target, strerror(errno));
-        free(target);
+    char *systarget = bash_sys_path(target);
+    if (BASH_CHDIR(systarget) != 0) {
+        bash_fprintf(stderr, "bash: popd: %s: %s\n", target, strerror(errno));
+        free(systarget); free(target);
         return 1;
     }
+    free(systarget);
     free(target);
     /* update PWD */
     char buf[4096];
@@ -4862,7 +5425,7 @@ static int bi_kill(bash_ctx_t *ctx, int argc, char **argv)
 {
     (void)ctx;
     if (argc < 2) {
-        fprintf(stderr, "bash: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ...\n");
+        bash_fprintf(stderr, "bash: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ...\n");
         return 1;
     }
     int sig = 15; /* TERM */
@@ -4881,7 +5444,7 @@ static int bi_kill(bash_ctx_t *ctx, int argc, char **argv)
             return 0;
         }
         if (strcmp(argv[1], "-s") == 0 || strcmp(argv[1], "-n") == 0) {
-            if (argc < 3) { fprintf(stderr, "bash: kill: -s: option requires an argument\n"); return 1; }
+            if (argc < 3) { bash_fprintf(stderr, "bash: kill: -s: option requires an argument\n"); return 1; }
             sig = atoi(argv[2]); start = 3;
         } else {
             /* -SIGNAME or -SIGNUM */
@@ -4900,9 +5463,9 @@ static int bi_kill(bash_ctx_t *ctx, int argc, char **argv)
     int rc = 0;
     for (int i = start; i < argc; i++) {
         int pid = atoi(argv[i]);
-        if (pid <= 0) { fprintf(stderr, "bash: kill: %s: arguments must be process or job IDs\n", argv[i]); rc = 1; continue; }
+        if (pid <= 0) { bash_fprintf(stderr, "bash: kill: %s: arguments must be process or job IDs\n", argv[i]); rc = 1; continue; }
         if (_bash_kill_pid(pid, sig) != 0) {
-            fprintf(stderr, "bash: kill: (%d) - %s\n", pid, strerror(errno));
+            bash_fprintf(stderr, "bash: kill: (%d) - %s\n", pid, strerror(errno));
             rc = 1;
         }
     }
@@ -4928,7 +5491,7 @@ static int bi_command(bash_ctx_t *ctx, int argc, char **argv)
             rc = _bash_spawn(prog, cmd.words, &so, NULL);
             free(prog);
         } else {
-            fprintf(stderr, "bash: %s: command not found\n", cmd.words[0]);
+            bash_fprintf(stderr, "bash: %s: command not found\n", cmd.words[0]);
             rc = 127;
         }
         _bash_redir_restore(&rs);
@@ -5013,7 +5576,7 @@ static int bi_exec(bash_ctx_t *ctx, int argc, char **argv)
     new_argv[argc - start] = NULL;
     execvp(new_argv[0], new_argv);
     free(new_argv);
-    fprintf(stderr, "bash: exec: %s: %s\n", argv[start], strerror(errno));
+    bash_fprintf(stderr, "bash: exec: %s: %s\n", argv[start], strerror(errno));
     return 127;
 }
 
@@ -5032,7 +5595,7 @@ static int bi_umask(bash_ctx_t *ctx, int argc, char **argv)
     char *endp;
     long m = strtol(argv[1], &endp, 8);
     if (*endp != 0 || m < 0 || m > 0777) {
-        fprintf(stderr, "bash: umask: %s: octal number out of range\n", argv[1]);
+        bash_fprintf(stderr, "bash: umask: %s: octal number out of range\n", argv[1]);
         return 1;
     }
     umask((mode_t)m);
@@ -5049,7 +5612,7 @@ static int bi_help(bash_ctx_t *ctx, int argc, char **argv)
             printf("%s: shell builtin\n", argv[1]);
             return 0;
         }
-        fprintf(stderr, "bash: help: no help topics match `%s'\n", argv[1]);
+        bash_fprintf(stderr, "bash: help: no help topics match `%s'\n", argv[1]);
         return 1;
     }
     printf("Shell builtins:\n");
@@ -5066,7 +5629,7 @@ static int bi_builtin(bash_ctx_t *ctx, int argc, char **argv)
     if (argc < 2) return 0;
     bash_builtin_fn bfn = _bash_find_builtin(argv[1]);
     if (!bfn) {
-        fprintf(stderr, "bash: builtin: %s: not a shell builtin\n", argv[1]);
+        bash_fprintf(stderr, "bash: builtin: %s: not a shell builtin\n", argv[1]);
         return 1;
     }
     return bfn(ctx, argc - 1, argv + 1);
@@ -5085,7 +5648,7 @@ static int bi_suspend(bash_ctx_t *ctx, int argc, char **argv)
 {
     (void)ctx; (void)argc; (void)argv;
     /* In a real shell this would SIGSTOP itself. Simplified: no-op. */
-    fprintf(stderr, "bash: suspend: cannot suspend (no job control)\n");
+    bash_fprintf(stderr, "bash: suspend: cannot suspend (no job control)\n");
     return 1;
 }
 
@@ -5093,7 +5656,7 @@ static int bi_getopts(bash_ctx_t *ctx, int argc, char **argv)
 {
     /* usage: getopts OPTSTRING NAME [arg...] */
     if (argc < 3) {
-        fprintf(stderr, "bash: getopts: usage: getopts optstring name [arg]\n");
+        bash_fprintf(stderr, "bash: getopts: usage: getopts optstring name [arg]\n");
         return 1;
     }
     const char *optstring = argv[1];
@@ -5137,7 +5700,7 @@ static int bi_getopts(bash_ctx_t *ctx, int argc, char **argv)
             optind++;
         } else {
             _bash_var_set(ctx, name, "?", 0, 0, 0);
-            fprintf(stderr, "bash: getopts: option requires an argument -- %c\n", opt);
+            bash_fprintf(stderr, "bash: getopts: option requires an argument -- %c\n", opt);
             return 1;
         }
     } else {
@@ -5237,13 +5800,17 @@ static int bi_compgen(bash_ctx_t *ctx, int argc, char **argv)
     if (want_files) {
         /* list current directory entries (non-. ..) */
 #ifdef BASH_PLATFORM_WINDOWS
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA(".\\*", &fd);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(L".\\*", &fd);
         if (h != INVALID_HANDLE_VALUE) {
             do {
-                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-                bash_barray_push(&words, _bash_xstrdup(fd.cFileName));
-            } while (FindNextFileA(h, &fd));
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                int ulen = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, NULL, 0, NULL, NULL);
+                if (ulen <= 0) continue;
+                char *name_u8 = (char *)_bash_xmalloc((size_t)ulen);
+                WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_u8, ulen, NULL, NULL);
+                bash_barray_push(&words, name_u8);
+            } while (FindNextFileW(h, &fd));
             FindClose(h);
         }
 #else
@@ -5304,7 +5871,8 @@ static int bi_compgen(bash_ctx_t *ctx, int argc, char **argv)
         }
     } else {
         for (int k = 0; k < words.len; k++) {
-            puts(words.items[k]);
+            bash_fputs(words.items[k], stdout);
+            putchar('\n');
         }
         fflush(stdout);
     }
@@ -5495,7 +6063,10 @@ static int _bash_do_exec_simple(bash_ctx_t *ctx, bash_cmd_t *cmd)
     /* external */
     char *prog = _bash_which(cmdname);
     if (!prog) {
-        fprintf(stderr, "bash: %s: command not found\n", cmdname);
+        bash_redir_state_t rs;
+        int redir_ok = (_bash_redir_apply(ctx, cmd, &rs) == 0);
+        bash_fprintf(stderr, "bash: %s: command not found\n", cmdname);
+        if (redir_ok) _bash_redir_restore(&rs);
         rc = 127; goto free_av;
     }
     int cls = _bash_classify_file(prog);
@@ -5960,7 +6531,7 @@ static int _bash_run_script(bash_ctx_t *ctx, const char *path, int argc, char **
 {
     size_t len;
     char *src = _bash_read_all(path, &len);
-    if (!src) { fprintf(stderr, "bash: %s: cannot open: %s\n", path, strerror(errno)); return 127; }
+    if (!src) { bash_fprintf(stderr, "bash: %s: cannot open: %s\n", path, strerror(errno)); return 127; }
     /* shebang: skip #!... line */
     if (len >= 2 && src[0] == '#' && src[1] == '!') {
         size_t i = 0;
@@ -6161,34 +6732,52 @@ static void _bash_list_dir_files(const char *dir, const char *pre, int only_exec
 {
 #ifdef BASH_PLATFORM_WINDOWS
     if (!dir || !*dir) return;
+    /* Build mask: dir + sep + "*"  (all in UTF-8)  */
     bash_bstr_t mask; bash_bstr_init(&mask);
     bash_bstr_puts(&mask, dir);
     size_t ml = mask.len;
     if (ml == 0 || (mask.data[ml-1] != BASH_SEP && mask.data[ml-1] != '/'))
         bash_bstr_putc(&mask, BASH_SEP);
     bash_bstr_puts(&mask, "*");
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(mask.data, &fd);
+
+    /* Convert UTF-8 mask to wide for FindFirstFileW so that CJK
+     * directory names (e.g. "新建文件夹") are matched correctly.
+     * The ANSI FindFirstFileA would receive GBK-encoded bytes and
+     * could not list a UTF-8-named directory at all — Tab completion
+     * for Chinese paths silently returned zero candidates.          */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, mask.data, -1, NULL, 0);
+    if (wlen <= 0) { bash_bstr_free(&mask); return; }
+    wchar_t *wmask = (wchar_t *)_bash_xmalloc((size_t)wlen * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, mask.data, -1, wmask, wlen);
     bash_bstr_free(&mask);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wmask, &fd);
+    free(wmask);
     if (h == INVALID_HANDLE_VALUE) return;
     size_t prelen = pre ? strlen(pre) : 0;
     do {
-        const char *name = fd.cFileName;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-        if (prelen != 0 && strncmp(name, pre, prelen) != 0) continue;
-        /* build full path for exec/dir checks */
-        bash_bstr_t full; bash_bstr_init(&full);
-        bash_bstr_puts(&full, dir);
-        size_t fl = full.len;
-        if (fl == 0 || (full.data[fl-1] != BASH_SEP && full.data[fl-1] != '/'))
-            bash_bstr_putc(&full, BASH_SEP);
-        bash_bstr_puts(&full, name);
+        /* Convert wide filename → UTF-8 so all comparisons match
+         * the shell's internal encoding (same as `pre` which is UTF-8). */
+        int ulen = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                                       NULL, 0, NULL, NULL);
+        if (ulen <= 0) continue;
+        char *name_u8 = (char *)_bash_xmalloc((size_t)ulen);
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                            name_u8, ulen, NULL, NULL);
+
+        if (strcmp(name_u8, ".") == 0 || strcmp(name_u8, "..") == 0) {
+            free(name_u8); continue;
+        }
+        if (prelen != 0 && strncmp(name_u8, pre, prelen) != 0) {
+            free(name_u8); continue;
+        }
         int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         int ok = 1;
         if (only_exec) {
             if (is_dir) ok = 0;
             else {
-                const char *ext = strrchr(name, '.');
+                const char *ext = strrchr(name_u8, '.');
                 if (!ext || (_stricmp(ext, ".exe") != 0 && _stricmp(ext, ".com") != 0 &&
                              _stricmp(ext, ".bat") != 0 && _stricmp(ext, ".cmd") != 0))
                     ok = 0;
@@ -6196,12 +6785,12 @@ static void _bash_list_dir_files(const char *dir, const char *pre, int only_exec
         }
         if (ok) {
             bash_bstr_t it; bash_bstr_init(&it);
-            bash_bstr_puts(&it, name);
+            bash_bstr_puts(&it, name_u8);
             if (add_slash_for_dir && is_dir) bash_bstr_putc(&it, '/');
             bash_barray_push(out, bash_bstr_detach(&it));
         }
-        bash_bstr_free(&full);
-    } while (FindNextFileA(h, &fd));
+        free(name_u8);
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(dir ? dir : ".");
@@ -6954,13 +7543,32 @@ static int utf8_display_cols(const char *buf, int byte_len)
  * (3 bytes UTF-8, 2 columns wide) don't cause cursor drift on ← → presses. */
 static void _bash_rl_redraw(const char *prompt, const char *buf, int len, int cur)
 {
+    /* Carriage return + ANSI escape sequences are pure ASCII, safe to emit as raw bytes.                    */
     fputs("\r", stdout);
-    fputs(prompt, stdout);
-    fwrite(buf, 1, len, stdout);
-    /* erase trailing characters that may remain from prior longer line */
+    /* Prompt is a NUL-terminated shell-internal UTF-8 string; bash_fputs() applies the UTF-8 -> host-code-page
+     * codec when stdout is an interactive console (matches the
+     * rest of bash output convention).                      */
+    bash_fputs(prompt, stdout);
+    /* The edit buffer `buf` is a raw UTF-8 byte slice of exactly
+     * `len` bytes; the API contract does NOT guarantee a trailing
+     * NUL, so we build a NUL-terminated heap copy first before
+     * handing it to enc_utf8_to_sys().  The converted string is
+     * what actually goes to the console 鈥?this is the fix for the
+     * previous garbled-CJK display bug where raw UTF-8 bytes were
+     * being interpreted by a non-UTF-8 console CP as GBK/ShiftJIS
+     * junk characters (e.g. 閺勵垰鎻╅柅鎺曠箷  instead of 鏄揩閫掕繕鏄揩). */
+    char *buf_nt   = _bash_xstrndup(buf, (size_t)len);
+    char *buf_conv = enc_utf8_to_sys(buf_nt);
+    fputs(buf_conv ? buf_conv : buf_nt, stdout);
+    enc_free(buf_conv);
+    free(buf_nt);
+    /* Erase trailing bytes left over from a previously longer line
+     * using ANSI EL (Erase in Line to end).  Pure ASCII escape. */
     fputs("\x1b[K", stdout); /* EL: erase to end of line */
-    /* move cursor back to cur position, using DISPLAY COLUMN COUNT so that
-     * wide chars (Chinese = 2 cols) don't desync the cursor position. */
+    /* Move cursor back to byte position `cur` using DISPLAY COLUMN
+     * accounting so CJK wide chars (2 display columns each) do not
+     * cause a prompt鈫攃ursor desync.  utf8_display_cols already works
+     * on the internal UTF-8 representation, so we keep it as-is.  */
     int total_cols = utf8_display_cols(buf, len);
     int cur_cols   = utf8_display_cols(buf, cur);
     int back = total_cols - cur_cols;
@@ -6981,7 +7589,7 @@ static int bi_history(bash_ctx_t *ctx, int argc, char **argv)
     int start = (n > 0 && n < g_hist_count - base) ? (g_hist_count - n) : base;
     for (int i = start; i < g_hist_count; i++) {
         const char *h = _bash_hist_get(i);
-        if (h) printf("  %d  %s\n", i + 1, h);
+        if (h) bash_fprintf(stdout, "  %d  %s\n", i + 1, h);
     }
     fflush(stdout);
     return 0;
@@ -6998,7 +7606,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
     g_hist_nav = -1;
     if (g_hist_saved) { free(g_hist_saved); g_hist_saved = NULL; }
 
-    fputs(prompt, stdout); fflush(stdout);
+    bash_fputs(prompt, stdout); fflush(stdout);
 
 #ifdef BASH_PLATFORM_WINDOWS
     {
@@ -7188,7 +7796,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
                     line_buf[0] = 0; len = 0; cur = 0;
                     g_hist_nav = -1;
                     free(g_hist_saved); g_hist_saved = NULL;
-                    fputs(prompt, stdout); fflush(stdout);
+                    bash_fputs(prompt, stdout); fflush(stdout);
                     continue;
                 }
                 if (c == '\b' || c == 127 /* DEL */) {
@@ -7262,7 +7870,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
                         int cols = (termsz + 1) / (colw + 1);
                         if (cols < 1) cols = 1;
                         for (int i = 0; i < n_cands; i++) {
-                            printf("%-*s", colw, arr[i]);
+                            bash_fprintf(stdout, "%-*s", colw, arr[i]);
                             if ((i + 1) % cols == 0) putchar('\n');
                         }
                         if (n_cands % cols != 0) putchar('\n');
@@ -7446,7 +8054,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
                     line_buf[0] = 0; len = 0; cur = 0;
                     g_hist_nav = -1;
                     free(g_hist_saved); g_hist_saved = NULL;
-                    fputs(prompt, stdout); fflush(stdout);
+                    bash_fputs(prompt, stdout); fflush(stdout);
                     continue;
                 }
                 if (c == '\b' || c == 127 /* DEL */ || vk == VK_BACK) {
@@ -7521,7 +8129,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
                         int cols = (termsz + 1) / (colw + 1);
                         if (cols < 1) cols = 1;
                         for (int ii = 0; ii < nn_cands; ii++) {
-                            printf("%-*s", colw, arr[ii]);
+                            bash_fprintf(stdout, "%-*s", colw, arr[ii]);
                             if ((ii + 1) % cols == 0) putchar('\n');
                         }
                         if (nn_cands % cols != 0) putchar('\n');
@@ -7699,7 +8307,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
             line_buf[0] = 0; len = 0; cur = 0;
             g_hist_nav = -1;
             free(g_hist_saved); g_hist_saved = NULL;
-            fputs(prompt, stdout); fflush(stdout);
+            bash_fputs(prompt, stdout); fflush(stdout);
             continue;
         }
         if (c == '\b' || c == 127 /* DEL */) {
@@ -7785,7 +8393,7 @@ static char *_bash_readline(bash_ctx_t *ctx, const char *prompt)
                 int cols = (termsz + 1) / (colw + 1);
                 if (cols < 1) cols = 1;
                 for (int i = 0; i < n_cands; i++) {
-                    printf("%-*s", colw, arr[i]);
+                    bash_fprintf(stdout, "%-*s", colw, arr[i]);
                     if ((i + 1) % cols == 0) putchar('\n');
                 }
                 if (n_cands % cols != 0) putchar('\n');
@@ -8117,71 +8725,128 @@ static void _bash_version(void)
     printf("Bash 5.3 additions: GLOBSORT, ${ cmd; } / ${ | cmd; }, source -p, read -E, compgen -V\n");
 }
 
-int main(int argc, char **argv)
-{
 #ifdef BASH_PLATFORM_WINDOWS
-    /* Force the console into UTF-8 (CP 65001) for both input and output.
-     * The C source is compiled with UTF-8 string literals, so without this
-     * the CRT's printf/putchar/fputs would re-interpret those bytes using
-     * the system ANSI code page (typically GBK on zh-CN Windows), producing
-     * the classic mojibake (e.g. "鎵撳彂" instead of "打发").  Setting the
-     * console code page to UTF-8 makes byte-oriented stdio render correctly.
-     * We also set ENABLE_VIRTUAL_TERMINAL_PROCESSING later for ANSI colours.
-     *
-     * IMPORTANT: only call these APIs when we are actually attached to a
-     * real console.  When stdout/stderr are redirected to a pipe/file
-     * (e.g. by VSCode, Nodepad++, SSHd, another shell), GetStdHandle may
-     * return a non-console handle or INVALID_HANDLE_VALUE, and calling
-     * SetConsole*CP on it can hang / silently fail / prevent the process
-     * from starting — exactly the "bash打不开" symptom.  We probe by
-     * calling GetConsoleMode, which fails gracefully with FALSE if the
-     * handle is not a real console buffer.                                 */
-    {
-        HANDLE ho = GetStdHandle(STD_OUTPUT_HANDLE);
-        HANDLE hi = GetStdHandle(STD_INPUT_HANDLE);
-        DWORD  dummy;
-        if (ho && ho != INVALID_HANDLE_VALUE && GetConsoleMode(ho, &dummy))
-            SetConsoleOutputCP(CP_UTF8);
-        if (hi && hi != INVALID_HANDLE_VALUE && GetConsoleMode(hi, &dummy))
-            SetConsoleCP(CP_UTF8);
-    }
+/* Console control handler — prevents Ctrl+C from killing bash.
+ *
+ * On Windows, pressing Ctrl+C generates a CTRL_C_EVENT that is
+ * delivered asynchronously to every process in the console process
+ * group.  The default handler calls ExitProcess, so bash (and not
+ * just the running child) dies — even while bash is blocked inside
+ * WaitForSingleObject waiting for a child (e.g. `sleep 10`) to exit.
+ *
+ * Returning TRUE means "this event is handled"; the default handler
+ * is skipped for bash, so bash survives.  The child process (which
+ * has its own default handler) still dies, which is the desired
+ * behaviour.  Other events (close, logoff, shutdown) fall through
+ * to the default handler so bash still exits when the console
+ * window is closed.                                                 */
+static BOOL WINAPI _bash_ctrl_handler(DWORD ctrl)
+{
+    if (ctrl == CTRL_C_EVENT)
+        return TRUE;
+    return FALSE;
+}
 #endif
 
+int main(int argc, char **argv)
+{
+    /* --- ENCODING MIDDLE-LAYER INITIALISATION ------------------------------
+     * We deliberately do NOT force the console to CP_UTF8 anymore.
+     * enc_init() probes the ACTUAL user/system code page:
+     *   Windows real console → GetConsoleCP / GetConsoleOutputCP
+     *   Windows redirected   → GetACP (system ANSI code page)
+     *   POSIX                 → nl_langinfo(CODESET) via setlocale()
+     * Bash will from now on run in UTF-8 INTERNALLY, and only translate
+     * strings where they cross the boundary (I/O, env, argv, child
+     * spawn, file-system).                                           */
+    enc_init();
+
+#ifdef BASH_PLATFORM_WINDOWS
+    /* Install Ctrl+C handler early so the default handler (which calls
+     * ExitProcess) never gets a chance to kill bash.  This must happen
+     * before any interactive loop or child-process wait.               */
+    SetConsoleCtrlHandler(_bash_ctrl_handler, TRUE);
+#endif
+
+char **argv_u = NULL;
+#ifdef BASH_PLATFORM_WINDOWS
+    {
+        int w_argc = 0;
+        LPWSTR *w_argv = CommandLineToArgvW(GetCommandLineW(), &w_argc);
+        if (w_argv && w_argc > 0) {
+            argc = w_argc;
+            argv_u = (char **)_bash_xmalloc(sizeof(char *) * (size_t)(w_argc + 1));
+            for (int i = 0; i < w_argc; i++) {
+                LPCWSTR ws = w_argv[i];
+                int nb = WideCharToMultiByte(CP_UTF8, 0, ws, -1, NULL, 0, NULL, NULL);
+                if (nb <= 0) { argv_u[i] = _bash_xstrdup(""); continue; }
+                char *u = (char *)_bash_xmalloc((size_t)nb);
+                WideCharToMultiByte(CP_UTF8, 0, ws, -1, u, nb, NULL, NULL);
+                argv_u[i] = u;
+            }
+            argv_u[w_argc] = NULL;
+            LocalFree(w_argv);
+        }
+    }
+    if (!argv_u) {
+        argv_u = (char **)_bash_xmalloc(sizeof(char *) * (size_t)(argc + 1));
+        for (int i = 0; i < argc; i++) argv_u[i] = enc_sys_to_utf8(argv[i]);
+        argv_u[argc] = NULL;
+    }
+#else
+    argv_u = (char **)_bash_xmalloc(sizeof(char *) * (size_t)(argc + 1));
+    for (int i = 0; i < argc; i++) argv_u[i] = enc_sys_to_utf8(argv[i]);
+    argv_u[argc] = NULL;
+#endif
     bash_ctx_t ctx; memset(&ctx, 0, sizeof(ctx));
     _bash_frame_init_global(&ctx);
-    ctx.script_name = argc > 0 ? argv[0] : "bash";
+    ctx.script_name = (argc > 0 && argv_u[0]) ? argv_u[0] : "bash";
     ctx.exit_code = 0;
     ctx.do_exit = 0;
     ctx.last_status = 0;
     ctx.bg_pid = 0;
     ctx.funcs = NULL;
 
-    /* seed env variables */
+    /* seed env variables — host-encoded getenv() values are converted to
+     * UTF-8 when pulling them into the shell's internal variable store.
+     * NOTE: BASH_GETCWD on Windows now returns UTF-8 directly via the
+     *       _bash_getcwd_u8() wrapper — no further enc_sys_to_utf8()
+     *       conversion should be applied here (double-converting would
+     *       mojibake the path).                                                  */
     char cwd[4096];
     if (BASH_GETCWD(cwd, sizeof(cwd))) {
         _bash_normalize_path(cwd);
         _bash_var_set(&ctx, "PWD", cwd, 1, 1, 0);
         ctx.pwd = _bash_xstrdup(cwd);
     }
-    char *home = getenv("HOME");
-    if (!home || !*home) {
+    char *home_sys = getenv("HOME");
+    char *home_u = NULL;
+    if (!home_sys || !*home_sys) {
 #ifdef BASH_PLATFORM_WINDOWS
-        /* On Windows, HOME is often not set by the system; MSYS2 sets it
-         * but the CRT _environ copy may not pick it up.  Fall back to
-         * USERPROFILE (which is always set on Windows) and push it into
-         * both the CRT environment (via _putenv_s) and the shell vars
-         * so that getenv("HOME") works everywhere from now on.         */
-        home = getenv("USERPROFILE");
-        if (home && *home) {
+        home_sys = getenv("USERPROFILE");
+#endif
+    }
+    if (home_sys && *home_sys) {
+        home_u = enc_sys_to_utf8(home_sys);
+        /* Sync back a "HOME=..." value to the CRT environment so child
+         * processes and CRT getenv() still find HOME.  The value on the
+         * CRT side must be in HOST (not UTF-8) encoding. */
+#ifdef BASH_PLATFORM_WINDOWS
+        {
             extern int __cdecl _putenv_s(const char *, const char *);
-            _putenv_s("HOME", home);
+            char *home_pu = enc_utf8_to_sys(home_u ? home_u : home_sys);
+            _putenv_s("HOME", home_pu ? home_pu : home_sys);
+            enc_free(home_pu);
         }
 #endif
-        if (!home || !*home) home = ".";
     }
-    _bash_var_set(&ctx, "HOME", home, 1, 1, 0);
-    const char *path_env = getenv("PATH");
-    if (path_env && *path_env) _bash_var_set(&ctx, "PATH", path_env, 1, 1, 0);
+    if (!home_u || !*home_u) { char *d = _bash_xstrdup("."); enc_free(home_u); home_u = d; }
+    _bash_var_set(&ctx, "HOME", home_u, 1, 1, 0);
+
+    const char *path_sys = getenv("PATH");
+    char *path_u = path_sys ? enc_sys_to_utf8(path_sys) : NULL;
+    if (path_u && *path_u) _bash_var_set(&ctx, "PATH", path_u, 1, 1, 0);
+
 #ifdef BASH_PLATFORM_WINDOWS
     /* Prepend bash.exe self directory to PATH so that companion commands
      * (in self-dir and self-dir/cmd/) are findable by child processes
@@ -8190,12 +8855,13 @@ int main(int argc, char **argv)
     {
         char *sd = _bash_get_self_dir();
         if (sd && *sd) {
+            _bash_normalize_path(sd);
+            /* self-dir is already in ASCII/UTF-8 path form (forward slashes),
+             * so no extra re-encoding needed; we copy to stay ownership-safe */
             const char *cur = _bash_var_get(&ctx, "PATH", NULL);
             if (!cur || !*cur) {
-                /* PATH was empty/unset — just use self dir */
                 _bash_var_set(&ctx, "PATH", sd, 1, 1, 0);
             } else {
-                /* Check if self dir is already in PATH */
                 int already = 0;
                 const char *p = cur;
                 while (*p) {
@@ -8261,10 +8927,7 @@ int main(int argc, char **argv)
         _bash_var_set(&ctx, "HISTSIZE", "500", 0, 0, 0);
         _bash_var_set(&ctx, "HISTFILESIZE", "500", 0, 0, 0);
         _bash_var_set(&ctx, "CMDTERM", "S", 0, 0, 0); /* Bash 5.3+ compat: CMDTERM=xterm-style terminal id */
-        const char *h = getenv("HOME");
-        if (h) _bash_var_set(&ctx, "HOME", h, 1, 1, 0);
-        const char *pth = getenv("PATH");
-        if (pth && *pth) _bash_var_set(&ctx, "PATH", pth, 1, 1, 0);
+        /* HOME/PATH are already seeded above with proper encoding conversion */
     }
 
 #ifdef BASH_PLATFORM_WINDOWS
@@ -8329,9 +8992,11 @@ int main(int argc, char **argv)
     const char *c_string = NULL;
 
     while (i < argc) {
-        if (strcmp(argv[i], "--help") == 0) { _bash_usage(argv[0]); return 0; }
-        if (strcmp(argv[i], "--version") == 0) { _bash_version(); return 0; }
-        if (strcmp(argv[i], "--test-compl") == 0) {
+        char *ai = argv_u[i];
+        if (!ai) break;
+        if (strcmp(ai, "--help") == 0)    { _bash_usage(argv_u[0] ? argv_u[0] : "bash"); return 0; }
+        if (strcmp(ai, "--version") == 0) { _bash_version(); return 0; }
+        if (strcmp(ai, "--test-compl") == 0) {
             /* hidden: run tab-completion self-tests and exit */
             #define TC(ln) do { \
                 const char *L = (ln); int cursor = (int)strlen(L); \
@@ -8360,15 +9025,16 @@ int main(int argc, char **argv)
             TC("cd ./l1/l2/l");
             TC("ls l1/l2/l3");
             TC("ls l");
+            TC("cd 新");          /* CJK prefix: 新建文件夹 must be found */
             return 0;
         }
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) { want_c = 1; c_string = argv[i+1]; i += 2; continue; }
-        if (strcmp(argv[i], "-s") == 0) { want_s = 1; i++; continue; }
-        if (strcmp(argv[i], "-i") == 0) { want_i = 1; i++; continue; }
-        if (strcmp(argv[i], "--") == 0) { i++; break; }
-        if (argv[i][0] == '-') {
-            fprintf(stderr, "bash: unrecognized option %s\n", argv[i]);
-            _bash_usage(argv[0]);
+        if (strcmp(ai, "-c") == 0 && i + 1 < argc) { want_c = 1; c_string = argv_u[i+1]; i += 2; continue; }
+        if (strcmp(ai, "-s") == 0) { want_s = 1; i++; continue; }
+        if (strcmp(ai, "-i") == 0) { want_i = 1; i++; continue; }
+        if (strcmp(ai, "--") == 0) { i++; break; }
+        if (ai[0] == '-') {
+            bash_fprintf(stderr, "bash: unrecognized option %s\n", ai);
+            _bash_usage(argv_u[0] ? argv_u[0] : "bash");
             return 2;
         }
         break;
@@ -8380,12 +9046,15 @@ int main(int argc, char **argv)
         rc = _bash_run_string(&ctx, c_string);
         if (ctx.do_exit) rc = ctx.exit_code;
     } else if (i < argc) {
-        const char *script = argv[i];
+        const char *script = argv_u[i];
         int sargc = argc - i - 1;
-        char **sargv = argv + i + 1;
+        char **sargv = argv_u + i + 1;
         rc = _bash_run_script(&ctx, script, sargc, sargv);
     } else if (want_s && !want_i) {
-        /* -s only: read all stdin as a script (bulk) */
+        /* -s only: read all stdin as a script (bulk).  The script body is
+         * treated as raw byte input — most authors save shell scripts in
+         * UTF-8, and our internal representation is UTF-8, so passthrough
+         * is the right default. */
         bash_bstr_t all; bash_bstr_init(&all);
         char buf[4096];
         while (fgets(buf, sizeof(buf), stdin))
@@ -8418,5 +9087,7 @@ int main(int argc, char **argv)
             bash_bstr_free(&all);
         }
     }
+    /* argv_u is intentionally leaked at exit (OS reclaims); it outlives any
+     * borrowed references (ctx.script_name etc.) that point into it.     */
     return rc;
 }
