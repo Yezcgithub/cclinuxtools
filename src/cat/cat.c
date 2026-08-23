@@ -114,6 +114,7 @@
 
 #ifdef CAT_PLATFORM_WINDOWS
     #include <windows.h>
+    #include <shellapi.h>
     #include <io.h>
     #include <fcntl.h>
     #define CAT_SET_BINARY_MODE(fd) _setmode((fd), _O_BINARY)
@@ -142,6 +143,9 @@
 
 /** @brief Maximum long option name length accepted by the parser */
 #define CAT_OPT_NAME_MAX 64
+
+/** @brief Formatted-output buffer for cat_printf / cat_err_printf macros */
+#define CAT_PRINTF_BUFSZ 2048
 
 /********************************
  *    typedefs
@@ -194,6 +198,12 @@ static void _cat_put_nonprint(unsigned char c);
 
 #ifdef CAT_PLATFORM_WINDOWS
 static int _cat_open_utf8(const char * path, const char * mode, FILE ** out_fp);
+static HANDLE _cat_std_handle_for_fd(int fd);
+static bool   _cat_is_console_stream(FILE * fp);
+static size_t _cat_write_win32(const void * buf, size_t len, FILE * fp);
+static char ** _cat_argv_utf8_alloc(int * argc, char ** argv);
+static void    _cat_argv_utf8_free(int argc, char ** argv_utf8);
+static void    _cat_console_set_utf8(void);
 #endif
 
 /********************************
@@ -217,49 +227,82 @@ static int _cat_open_utf8(const char * path, const char * mode, FILE ** out_fp);
     #define cat_err_stream stderr
 #endif
 
-/**
- * @brief Safe formatted print to stdout.
- *        Requires explicit format string; result discarded via (void).
- *
- * Supports zero variadic arguments via ", ##__VA_ARGS__".
- */
-#ifndef cat_printf
-    #define cat_printf(fmt, ...) (void)printf((fmt), ##__VA_ARGS__)
-#endif
+#ifdef CAT_PLATFORM_WINDOWS
 
 /**
- * @brief Safe formatted print to stderr.
- *        NULL-safe on the error stream and requires explicit format string.
+ * @brief Platform-aware raw byte emitter.  Console streams use
+ *        WriteConsoleW so CJK glyphs render correctly on CP936 hosts;
+ *        disk, pipe, and non-stdio streams emit raw UTF-8 bytes.
+ * @sa _cat_write_win32
  */
-#ifndef cat_err_printf
-    #define cat_err_printf(fmt, ...) \
-        do { if (cat_err_stream) { (void)fprintf((cat_err_stream), (fmt), ##__VA_ARGS__); } } while (0)
-#endif
+#define cat_fwrite(buf, sz, nm, fp) \
+    (void)_cat_write_win32((buf), (size_t)(sz) * (size_t)(nm), (fp))
 
 /**
- * @brief Write a single character to stdout.
- *        Casts to unsigned char first so values with the MSB set do
- *        not trigger undefined behavior in putchar's int argument.
+ * @brief Formatted print routed through the platform-aware emitter.
  */
-#ifndef cat_putchar
-    #define cat_putchar(ch) (void)putchar((int)(unsigned char)(ch))
-#endif
+#define cat_printf(fmt, ...) \
+    do { \
+        char _catpf[CAT_PRINTF_BUFSZ]; \
+        int  _catpf_n = snprintf(_catpf, sizeof(_catpf), (fmt), ##__VA_ARGS__); \
+        if (_catpf_n > 0) { \
+            (void)_cat_write_win32(_catpf, (size_t)_catpf_n, cat_out_stream); \
+        } \
+    } while (0)
 
 /**
- * @brief Write a NUL-terminated string to a stdio stream.
- *        Signature identical to @c fputs() .
+ * @brief Formatted error print (stderr) routed through the platform
+ *        emitter so that error messages are byte-correct on all host
+ *        console configurations.
  */
-#ifndef cat_fputs
-    #define cat_fputs(str, stream) (void)fputs((str), (stream))
-#endif
+#define cat_err_printf(fmt, ...) \
+    do { \
+        char _catepf[CAT_PRINTF_BUFSZ]; \
+        int  _catepf_n = snprintf(_catepf, sizeof(_catepf), (fmt), ##__VA_ARGS__); \
+        if (_catepf_n > 0 && cat_err_stream) { \
+            (void)_cat_write_win32(_catepf, (size_t)_catepf_n, cat_err_stream); \
+        } \
+    } while (0)
 
 /**
- * @brief Safe stdio stream flush — NULL-safe.
+ * @brief Single-character stdout emitter (platform-aware).
  */
-#ifndef cat_fflush
-    #define cat_fflush(stream) \
-        do { if ((stream)) { (void)fflush((stream)); } } while (0)
-#endif
+#define cat_putchar(ch) \
+    do { \
+        unsigned char _catpc_c = (unsigned char)(ch); \
+        (void)_cat_write_win32(&_catpc_c, 1U, cat_out_stream); \
+    } while (0)
+
+/**
+ * @brief NUL-terminated string emitter (platform-aware).
+ */
+#define cat_fputs(str, stream) \
+    do { \
+        const char * _catfps = (str); \
+        if (_catfps) { \
+            size_t _catfpl = strlen(_catfps); \
+            if (_catfpl) { (void)_cat_write_win32(_catfps, _catfpl, (stream)); } \
+        } \
+    } while (0)
+
+/**
+ * @brief NULL-safe stream flush.
+ */
+#define cat_fflush(stream) \
+    do { if ((stream)) { (void)fflush((stream)); } } while (0)
+
+#else  /* CAT_PLATFORM_POSIX */
+
+#define cat_fwrite(buf, sz, nm, fp)  (void)fwrite((buf), (sz), (nm), (fp))
+#define cat_printf(fmt, ...)         (void)printf((fmt), ##__VA_ARGS__)
+#define cat_err_printf(fmt, ...) \
+    do { if (cat_err_stream) { (void)fprintf((cat_err_stream), (fmt), ##__VA_ARGS__); } } while (0)
+#define cat_putchar(ch)              (void)putchar((int)(unsigned char)(ch))
+#define cat_fputs(str, stream)       (void)fputs((str), (stream))
+#define cat_fflush(stream) \
+    do { if ((stream)) { (void)fflush((stream)); } } while (0)
+
+#endif /* CAT_PLATFORM_WINDOWS / POSIX */
 
 /**
  * @brief Safe strcmp wrapper with NULL guards.
@@ -319,23 +362,56 @@ static int _cat_open_utf8(const char * path, const char * mode, FILE ** out_fp);
 int main(int argc, char ** argv)
 {
     cat_opts_t opts;
+#ifdef CAT_PLATFORM_WINDOWS
+    char **    argv_utf8 = NULL;
+#endif
+    int        exit_code;
+
     memset(&opts, 0, sizeof(opts));
+
+#ifdef CAT_PLATFORM_WINDOWS
+    /* The MSVCRT passes argv decoded via the active ACP (typically CP936
+     * on Chinese systems), which mangles any non-ASCII file names / option
+     * arguments before main even runs.  Re-build a canonical UTF-8 argv
+     * from the authoritative UTF-16 command line. */
+    {
+        int     wc  = 0;
+        char ** u8a = _cat_argv_utf8_alloc(&wc, argv);
+        if (u8a) {
+            argc      = wc;
+            argv_utf8 = u8a;
+            argv      = u8a;
+        }
+    }
+    /* Binary mode on all three stdio streams avoids CRLF mangling and keeps
+     * byte-exact output tests stable. */
+    CAT_SET_BINARY_MODE(_fileno(stdin));
+    CAT_SET_BINARY_MODE(_fileno(stdout));
+    CAT_SET_BINARY_MODE(_fileno(stderr));
+    /* Try to pin the console output code page to UTF-8.  cat writes BYTES,
+     * not characters — this avoids the console reading our UTF-8 bytes
+     * (help / version / error messages with CJK file names) as CP936, and
+     * also avoids the old WriteConsoleW path which would misinterpret
+     * GBK file bytes as UTF-8 and flood the screen with replacement chars
+     * (the '���������������' seen by users).  Call once here so that
+     * individual per-write calls can simply use the raw WriteFile path
+     * for console streams. */
+    _cat_console_set_utf8();
+#endif
 
     int first_file = _cat_parse_args(argc, argv, &opts);
     if (first_file < 0) {
+#ifdef CAT_PLATFORM_WINDOWS
+        _cat_argv_utf8_free(argc, argv_utf8);
+#endif
         return 1;
     }
-
-    /* On Windows, set stdout to binary mode so binary files pass through */
-#ifdef CAT_PLATFORM_WINDOWS
-    CAT_SET_BINARY_MODE(_fileno(stdout));
-#endif
 
     cat_state_t st;
     memset(&st, 0, sizeof(st));
     st.at_line_start = true;
 
-    int exit_code = 0;
+    exit_code = 0;
 
     int nfiles = argc - first_file;
     if (nfiles == 0) {
@@ -353,6 +429,9 @@ int main(int argc, char ** argv)
     }
 
     cat_fflush(cat_out_stream);
+#ifdef CAT_PLATFORM_WINDOWS
+    _cat_argv_utf8_free(argc, argv_utf8);
+#endif
     return exit_code;
 }
 
@@ -559,6 +638,191 @@ static int _cat_parse_args(int argc, char ** argv, cat_opts_t * opts)
 }
 
 #ifdef CAT_PLATFORM_WINDOWS
+
+/**
+ * @brief Resolve a libc fd (0/1/2) to its standard Win32 handle.
+ */
+static HANDLE _cat_std_handle_for_fd(int fd)
+{
+    if (fd == 0)      { return GetStdHandle(STD_INPUT_HANDLE);  }
+    else if (fd == 1) { return GetStdHandle(STD_OUTPUT_HANDLE); }
+    else if (fd == 2) { return GetStdHandle(STD_ERROR_HANDLE);  }
+    return INVALID_HANDLE_VALUE;
+}
+
+/**
+ * @brief True if @p fp is a real console screen buffer.
+ */
+static bool _cat_is_console_stream(FILE * fp)
+{
+    HANDLE h;
+    DWORD  mode = 0;
+    int    fd;
+
+    if (!fp) { return false; }
+    fd = _fileno(fp);
+    h  = _cat_std_handle_for_fd(fd);
+    if (h == INVALID_HANDLE_VALUE || !h) { return false; }
+    return (GetConsoleMode(h, &mode) != FALSE);
+}
+
+/**
+ * @brief Windows-aware byte emitter for stdout/stderr.
+ *
+ * IMPORTANT – cat's entire contract is BYTE-EXACT passthrough of file
+ * content.  We MUST NOT re-encode arbitrary write payloads.  The old
+ * WriteConsoleW + MultiByteToWideChar(CP_UTF8) path was incorrect for
+ * cat because it interpreted every incoming byte as UTF-8, which turned
+ * GBK-encoded (or any other non-UTF-8) file content into screens full
+ * of replacement chars (the infamous "���������������").
+ *
+ * New strategy:
+ *   1. At startup we call SetConsoleOutputCP(CP_UTF8) via
+ *      _cat_console_set_utf8() so that console windows interpret raw
+ *      bytes we write as UTF-8.
+ *   2. For console streams use WriteFile() directly with the raw
+ *      bytes.  This is byte-exact: our own UTF-8 messages (help,
+ *      version, error strings with CJK file names etc.) display
+ *      correctly, and GBK / binary / mixed file content is preserved
+ *      exactly (if the user cat's a GBK file in a UTF-8 console the
+ *      glyphs may be wrong for CJK, but BYTES are not corrupted and
+ *      piping to a file / another process gets the exact content).
+ *   3. For disk, pipe, and non-stdio streams -> plain fwrite (same as
+ *      POSIX).
+ */
+static size_t _cat_write_win32(const void * buf, size_t len, FILE * fp)
+{
+    int  fd;
+    bool is_std;
+
+    if (!fp) { return 0; }
+    fd     = _fileno(fp);
+    is_std = (fd == 1) || (fd == 2);
+
+    /* Non-stdio streams (e.g. files opened via _cat_open_utf8) -> raw */
+    if (!is_std) { return fwrite(buf, 1, len, fp); }
+
+    if (_cat_is_console_stream(fp)) {
+        HANDLE h = _cat_std_handle_for_fd(fd);
+        DWORD  written = 0;
+        BOOL   ok;
+
+        if (len == 0) { return 0; }
+        if (h == INVALID_HANDLE_VALUE || !h) {
+            return fwrite(buf, 1, len, fp);
+        }
+        ok = WriteFile(h, buf, (DWORD)len, &written, NULL);
+        if (!ok) { return fwrite(buf, 1, len, fp); }
+        return (size_t)written;
+    }
+
+    /* disk, pipe, unknown streams -> raw bytes */
+    return fwrite(buf, 1, len, fp);
+}
+
+/**
+ * @brief Switch the attached console to UTF-8 (best-effort).
+ *
+ * Without this, a Chinese Windows console running on CP936 would
+ * interpret our UTF-8 error / help / version / CJK-filename strings
+ * as GBK bytes and render garbage.  Setting CP_UTF8 allows the raw
+ * WriteFile path used above to display OUR strings correctly while
+ * still being byte-exact for file payloads.
+ */
+static void _cat_console_set_utf8(void)
+{
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD  m   = 0;
+    BOOL   anyConsole = FALSE;
+
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL &&
+        GetConsoleMode(hOut, &m)) { anyConsole = TRUE; }
+    if (!anyConsole && hErr != INVALID_HANDLE_VALUE && hErr != NULL &&
+        GetConsoleMode(hErr, &m))  { anyConsole = TRUE; }
+
+    if (anyConsole) {
+        (void)SetConsoleOutputCP(CP_UTF8);
+        (void)SetConsoleCP(CP_UTF8);
+    }
+}
+
+/**
+ * @brief Rebuild a UTF-8 argv vector from the real process command line.
+ *
+ * MSVCRT main() argv is decoded using the current ACP, which is
+ * typically CP936 on Chinese systems, so any non-ASCII argument is
+ * already byte-corrupted on entry.  We re-read the authoritative
+ * UTF-16 command line and transcode each argument to UTF-8.
+ */
+static char ** _cat_argv_utf8_alloc(int * pargc, char ** argv_orig)
+{
+    LPWSTR * wargv;
+    int      wargc;
+    int      i;
+    char **  u8a;
+
+    (void)argv_orig;
+    if (!pargc) { return NULL; }
+    wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) { return NULL; }
+
+    u8a = (char **)calloc((size_t)wargc + 1U, sizeof(char *));
+    if (!u8a) {
+        LocalFree(wargv);
+        return NULL;
+    }
+
+    for (i = 0; i < wargc; i++) {
+        int    wlen = (int)wcslen(wargv[i]);
+        int    blen;
+        char * buf;
+
+        if (wlen == 0) {
+            u8a[i] = (char *)calloc(1U, sizeof(char));
+            if (!u8a[i]) { break; }
+            u8a[i][0] = '\0';
+            continue;
+        }
+        blen = WideCharToMultiByte(CP_UTF8, 0, wargv[i], wlen,
+                                   NULL, 0, NULL, NULL);
+        if (blen <= 0) { u8a[i] = NULL; break; }
+        buf = (char *)malloc((size_t)blen + 1U);
+        if (!buf) { u8a[i] = NULL; break; }
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], wlen,
+                            buf, blen, NULL, NULL);
+        buf[blen] = '\0';
+        u8a[i] = buf;
+    }
+
+    if (i < wargc) {
+        int j;
+        for (j = 0; j < i; j++) { free(u8a[j]); }
+        free(u8a);
+        LocalFree(wargv);
+        return NULL;
+    }
+
+    LocalFree(wargv);
+    u8a[wargc] = NULL;
+    *pargc = wargc;
+    return u8a;
+}
+
+/**
+ * @brief Release a UTF-8 argv vector produced by _cat_argv_utf8_alloc.
+ */
+static void _cat_argv_utf8_free(int argc, char ** argv_utf8)
+{
+    int i;
+    if (!argv_utf8) { return; }
+    for (i = 0; i < argc; i++) {
+        free(argv_utf8[i]);
+        argv_utf8[i] = NULL;
+    }
+    free(argv_utf8);
+}
+
 /**
  * @brief Open a file using UTF-8 path (converted to wide on Windows).
  * @param path   UTF-8 file path (or "-" for stdin)

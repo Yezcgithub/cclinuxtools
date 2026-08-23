@@ -135,6 +135,7 @@
 
 #ifdef LESS_PLATFORM_WINDOWS
     #include <windows.h>
+    #include <shellapi.h>
     #include <io.h>
     #include <fcntl.h>
     #include <conio.h>          /* _getch() for raw keystroke reading       */
@@ -389,12 +390,12 @@ static int    _less_interactive(const less_opts_t * opts, char ** files, int nfi
 #ifdef LESS_PLATFORM_WINDOWS
 static HANDLE _less_std_handle_for_fd(int fd);
 static bool   _less_is_console_stream(FILE * fp);
-static bool   _less_is_disk_stream(FILE * fp);
-static bool   _less_is_pipe_stream(FILE * fp);
-static UINT   _less_output_codepage(void);
-static size_t _less_write_pipe_cp(const void * buf, size_t len, FILE * fp);
 static size_t _less_write_win32(const void * buf, size_t len, FILE * fp);
+static char ** _less_argv_utf8_alloc(int * argc, char ** argv);
+static void    _less_argv_utf8_free(int argc, char ** argv_utf8);
 #endif
+
+static FILE * _less_fopen_utf8(const char * path, const char * mode);
 
 /********************************
  *    macros
@@ -511,16 +512,36 @@ static size_t _less_write_win32(const void * buf, size_t len, FILE * fp);
 int main(int argc, char ** argv)
 {
     less_opts_t opts;
-    char **      files   = NULL;
-    int          nfiles  = 0;
+    char **      files      = NULL;
+    int          nfiles     = 0;
     int          rc;
+    char **      argv_utf8  = NULL;
 
     memset(&opts, 0, sizeof(opts));
     opts.tab_width = LESS_DEFAULT_TABS;
 
+#ifdef LESS_PLATFORM_WINDOWS
+    /* MSVCRT populates argv with bytes decoded via the active ACP
+     * (typically CP936 on Chinese systems).  Reconstruct a UTF-8 argv
+     * from the real UTF-16 command line so that filenames, search
+     * patterns, and prompt strings are byte-correct everywhere. */
+    {
+        int     wc  = 0;
+        char ** u8a = _less_argv_utf8_alloc(&wc, argv);
+        if (u8a) {
+            argc      = wc;
+            argv_utf8 = u8a;
+            argv      = u8a;
+        }
+    }
+#endif
+
     rc = _less_parse_args(argc, argv, &opts, &files, &nfiles);
     if (rc != 0) {
         less_safe_free(opts.plus_cmd);
+#ifdef LESS_PLATFORM_WINDOWS
+        _less_argv_utf8_free(argc, argv_utf8);
+#endif
         return rc;
     }
 
@@ -535,12 +556,59 @@ int main(int argc, char ** argv)
     rc = _less_dispatch(&opts, files, nfiles);
 
     less_safe_free(opts.plus_cmd);
+#ifdef LESS_PLATFORM_WINDOWS
+    _less_argv_utf8_free(argc, argv_utf8);
+#endif
     return rc;
 }
 
 /********************************
  *    static functions
  ********************************/
+
+/**
+ * @brief Open a file with a UTF-8 encoded path.
+ *
+ * On POSIX systems, @c fopen paths are opaque byte sequences so plain
+ * fopen works correctly for UTF-8.  On Windows, however, the MSVCRT
+ * narrow-character @c fopen decodes the path using the active ANSI
+ * code page (typically CP936 on Chinese hosts), which corrupts any
+ * non-ACP byte sequence such as UTF-8.  We therefore transcode to
+ * UTF-16 and call @c _wfopen instead.
+ */
+static FILE * _less_fopen_utf8(const char * path, const char * mode)
+{
+    if (!path || !mode) { return NULL; }
+
+#ifdef LESS_PLATFORM_WINDOWS
+    {
+        int      wpath_len;
+        int      wmode_len;
+        wchar_t *wpath = NULL;
+        wchar_t *wmode = NULL;
+        FILE *   fp;
+
+        wpath_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        if (wpath_len <= 0) { return NULL; }
+        wpath = (wchar_t *)malloc((size_t)wpath_len * sizeof(wchar_t));
+        if (!wpath) { return NULL; }
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wpath_len);
+
+        wmode_len = MultiByteToWideChar(CP_UTF8, 0, mode, -1, NULL, 0);
+        if (wmode_len <= 0) { free(wpath); return NULL; }
+        wmode = (wchar_t *)malloc((size_t)wmode_len * sizeof(wchar_t));
+        if (!wmode) { free(wpath); return NULL; }
+        MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, wmode_len);
+
+        fp = _wfopen(wpath, wmode);
+        free(wpath);
+        free(wmode);
+        return fp;
+    }
+#else
+    return fopen(path, mode);
+#endif
+}
 
 /* --------------------------------------------------------------------
  *  help / version
@@ -840,7 +908,7 @@ static int _less_stream_file(const char * path, FILE * fp,
             fp = stdin;
         }
         else {
-            fp = fopen(path, "rb");
+            fp = _less_fopen_utf8(path, "rb");
             if (!fp) {
                 less_eprintf("less: %s: %s\n",
                              path ? path : "stdin",
@@ -1374,7 +1442,7 @@ static int _less_load_lines(char ** files, int nfiles, less_lines_t * ll)
                 path = "stdin";
             }
             else {
-                fp = fopen(path, "rb");
+                fp = _less_fopen_utf8(path, "rb");
                 if (!fp) {
                     less_eprintf("less: %s: %s\n", path, strerror(errno));
                     continue;
@@ -1935,18 +2003,18 @@ static int _less_dispatch(const less_opts_t * opts, char ** files, int nfiles)
     /* Set up log file if requested. */
     if (opts->log_file) {
         if (opts->log_overwrite) {
-            log_fp = fopen(opts->log_file, "wb");
+            log_fp = _less_fopen_utf8(opts->log_file, "wb");
         }
         else {
             /* Refuse to overwrite an existing file (GNU less semantics). */
-            FILE * probe = fopen(opts->log_file, "rb");
+            FILE * probe = _less_fopen_utf8(opts->log_file, "rb");
             if (probe) {
                 (void)fclose(probe);
                 less_eprintf("less: %s: file exists (use -O to overwrite)\n",
                              opts->log_file);
                 return 1;
             }
-            log_fp = fopen(opts->log_file, "wb");
+            log_fp = _less_fopen_utf8(opts->log_file, "wb");
         }
         if (!log_fp) {
             less_eprintf("less: %s: %s\n",
@@ -2286,6 +2354,90 @@ static int _less_parse_args(int argc, char ** argv, less_opts_t * opts,
 #ifdef LESS_PLATFORM_WINDOWS
 
 /**
+ * @brief Reconstruct a UTF-8 encoded argv from the real process command line.
+ *
+ * The MSVCRT main() argv array is populated from the process command line
+ * using the active ANSI code page, which is typically CP936 on Chinese
+ * hosts.  Any non-ASCII argument (CJK filenames, patterns) is therefore
+ * byte-mangled before main even runs.  We re-read the authoritative
+ * UTF-16 command line via GetCommandLineW(), parse it with
+ * CommandLineToArgvW(), and transcode every element to canonical UTF-8.
+ *
+ * Returns @c NULL on OOM / API failure and leaves @p *pargc unchanged so
+ * callers can fall back to the original argv.
+ */
+static char ** _less_argv_utf8_alloc(int * pargc, char ** argv_orig)
+{
+    LPWSTR * wargv;
+    int      wargc;
+    int      i;
+    char **  u8a;
+
+    (void)argv_orig;
+    if (!pargc) { return NULL; }
+    wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) { return NULL; }
+
+    u8a = (char **)calloc((size_t)wargc + 1U, sizeof(char *));
+    if (!u8a) {
+        LocalFree(wargv);
+        return NULL;
+    }
+
+    for (i = 0; i < wargc; i++) {
+        int    wlen = (int)wcslen(wargv[i]);
+        int    blen;
+        char * buf;
+
+        if (wlen == 0) {
+            u8a[i] = (char *)calloc(1U, sizeof(char));
+            if (!u8a[i]) { break; }
+            u8a[i][0] = '\0';
+            continue;
+        }
+        blen = WideCharToMultiByte(CP_UTF8, 0, wargv[i], wlen,
+                                   NULL, 0, NULL, NULL);
+        if (blen <= 0) {
+            u8a[i] = NULL;
+            break;
+        }
+        buf = (char *)malloc((size_t)blen + 1U);
+        if (!buf) {
+            u8a[i] = NULL;
+            break;
+        }
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], wlen,
+                            buf, blen, NULL, NULL);
+        buf[blen] = '\0';
+        u8a[i] = buf;
+    }
+
+    if (i < wargc) {
+        int j;
+        for (j = 0; j < i; j++) { less_safe_free(u8a[j]); }
+        less_safe_free(u8a);
+        LocalFree(wargv);
+        return NULL;
+    }
+
+    LocalFree(wargv);
+    u8a[wargc] = NULL;
+    *pargc = wargc;
+    return u8a;
+}
+
+/**
+ * @brief Release an argv vector produced by _less_argv_utf8_alloc.
+ */
+static void _less_argv_utf8_free(int argc, char ** argv_utf8)
+{
+    int i;
+    if (!argv_utf8) { return; }
+    for (i = 0; i < argc; i++) { less_safe_free(argv_utf8[i]); }
+    less_safe_free(argv_utf8);
+}
+
+/**
  * @brief Resolve a stdio fd (0/1/2) to its Win32 HANDLE.
  */
 static HANDLE _less_std_handle_for_fd(int fd)
@@ -2313,99 +2465,16 @@ static bool _less_is_console_stream(FILE * fp)
 }
 
 /**
- * @brief Test whether @p fp is bound to a disk file.
- */
-static bool _less_is_disk_stream(FILE * fp)
-{
-    HANDLE h;
-    int    fd;
-
-    if (!fp) { return false; }
-    fd = _fileno(fp);
-    h  = _less_std_handle_for_fd(fd);
-    if (h == INVALID_HANDLE_VALUE || !h) { return false; }
-    return (GetFileType(h) == FILE_TYPE_DISK);
-}
-
-/**
- * @brief Test whether @p fp is bound to an anonymous pipe.
- */
-static bool _less_is_pipe_stream(FILE * fp)
-{
-    HANDLE h;
-    int    fd;
-
-    if (!fp) { return false; }
-    fd = _fileno(fp);
-    h  = _less_std_handle_for_fd(fd);
-    if (h == INVALID_HANDLE_VALUE || !h) { return false; }
-    return (GetFileType(h) == FILE_TYPE_PIPE);
-}
-
-/**
- * @brief Return the active console output code page (fallback to ACP/UTF-8).
- */
-static UINT _less_output_codepage(void)
-{
-    UINT cp = GetConsoleOutputCP();
-    if (cp == 0U) { cp = GetACP(); }
-    if (cp == 0U) { cp = 65001U; }
-    return cp;
-}
-
-/**
- * @brief Write to a pipe stream, transcoding UTF-8 to the console CP.
- *
- * PowerShell 5.x consumes external-program output via an anonymous pipe
- * and decodes it using the console output code page (typically CP936 on
- * Chinese hosts).  To render CJK glyphs correctly we must emit bytes in
- * that code page rather than raw UTF-8.
- */
-static size_t _less_write_pipe_cp(const void * buf, size_t len, FILE * fp)
-{
-    UINT      cp    = _less_output_codepage();
-    int       fd    = _fileno(fp);
-    HANDLE    h     = _less_std_handle_for_fd(fd);
-    int       wlen;
-    wchar_t * wbuf  = NULL;
-    int       blen;
-    char    * obuf  = NULL;
-    DWORD     written = 0;
-    BOOL      ok;
-
-    if (len == 0)                                          { return 0; }
-    if (cp == 65001U)                                      { return fwrite(buf, 1, len, fp); }
-    if (h == INVALID_HANDLE_VALUE || !h)                   { return fwrite(buf, 1, len, fp); }
-
-    wlen = MultiByteToWideChar(CP_UTF8, 0, (const char *)buf, (int)len, NULL, 0);
-    if (wlen <= 0) { return fwrite(buf, 1, len, fp); }
-    wbuf = (wchar_t *)malloc((size_t)(wlen + 1) * sizeof(wchar_t));
-    if (!wbuf) { return fwrite(buf, 1, len, fp); }
-    MultiByteToWideChar(CP_UTF8, 0, (const char *)buf, (int)len, wbuf, wlen);
-    wbuf[wlen] = L'\0';
-
-    blen = WideCharToMultiByte(cp, 0, wbuf, wlen, NULL, 0, NULL, NULL);
-    if (blen <= 0) { free(wbuf); return fwrite(buf, 1, len, fp); }
-    obuf = (char *)malloc((size_t)(blen + 1));
-    if (!obuf) { free(wbuf); return fwrite(buf, 1, len, fp); }
-    WideCharToMultiByte(cp, 0, wbuf, wlen, obuf, blen, NULL, NULL);
-    obuf[blen] = '\0';
-
-    ok = WriteFile(h, obuf, (DWORD)blen, &written, NULL);
-    free(wbuf);
-    free(obuf);
-    if (!ok) { return fwrite(buf, 1, len, fp); }
-    (void)written;
-    return len;
-}
-
-/**
  * @brief Windows output router for stdout/stderr.
  *
- * - Console: UTF-8 → UTF-16LE → WriteConsoleW (correct CJK display).
- * - Disk file: raw UTF-8 bytes (byte-exact test output).
- * - Pipe (e.g. PowerShell 5.x): UTF-8 → console code page.
- * - Other streams (explicit -o FILE etc.): plain fwrite.
+ * - Console: UTF-8 → UTF-16LE → WriteConsoleW (correct CJK display on
+ *   legacy CP936 consoles).
+ * - Disk / pipe / other: raw UTF-8 bytes.  Modern PowerShell 5.x+ hosts
+ *   decode piped bytes with Console.OutputEncoding (UTF-8 on modern
+ *   systems), and byte-exact tests require parity with GNU less output
+ *   (disk and pipe must use identical bytes).
+ * - Non-stdio streams (explicit -o FILE, temporary buffers, ...): plain
+ *   fwrite.
  */
 static size_t _less_write_win32(const void * buf, size_t len, FILE * fp)
 {
@@ -2440,8 +2509,7 @@ static size_t _less_write_win32(const void * buf, size_t len, FILE * fp)
         return len;
     }
 
-    if (_less_is_disk_stream(fp)) { return fwrite(buf, 1, len, fp); }
-    if (_less_is_pipe_stream(fp)) { return _less_write_pipe_cp(buf, len, fp); }
+    /* disk, pipe, and unknown streams all emit raw UTF-8 bytes. */
     return fwrite(buf, 1, len, fp);
 }
 
