@@ -20,6 +20,7 @@ mkdir "%TD%\tmp"     2>nul
 
 echo === BUILD ===
 gcc -O2 -std=c99 -Wall -Wextra -o bash.exe bash.c
+gcc -O2 -std=c99 -Wall -Wextra -o sh.exe bash.c
 if errorlevel 1 goto :err
 
 set "PASS=0"

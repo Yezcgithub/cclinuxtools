@@ -19,8 +19,10 @@ mkdir -p "$TD/tmp"
 echo "=== BUILD ==="
 if command -v gcc >/dev/null 2>&1; then
     gcc -O2 -std=c99 -Wall -Wextra -o bash bash.c || exit 1
+    gcc -O2 -std=c99 -Wall -Wextra -o sh bash.c || exit 1
 elif command -v cc >/dev/null 2>&1; then
     cc  -O2 -std=c99 -Wall -Wextra -o bash bash.c || exit 1
+    cc  -O2 -std=c99 -Wall -Wextra -o sh bash.c || exit 1
 else
     echo "no gcc/cc" >&2; exit 1
 fi
