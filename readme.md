@@ -1,129 +1,135 @@
-﻿# A Cross-Platform Linux Tool Collection
-
-Glad you found this open-source project. Hope it helps you.
-
+# Cross-platform Linux Toolset
 
 ## 1. Introduction
 
-- **Single-file implementation**: Each tool depends only on the standard C library. Copy a single `.c` file and compile it — no dependencies to install.
-- **Pure C99**: Fully compliant with ISO C99. POSIX features are declared via standard feature macros, ensuring maximum portability.
-- **Cross-platform abstraction**: Each source file has built-in platform detection at the top, calling the correct native API for each OS.
-- **POSIX-style paths**: All platforms output forward-slash paths with UTF-8 encoding. Windows uses wide-character APIs for non-ANSI path support.
-- **Automated testing**: Build scripts include extensive regression tests covering major CLI options and edge cases.
-- **Performance first**: Direct system API calls with no unnecessary abstraction layers; regex compile caching, dynamic strings, and other optimizations.
-- **MIT License**: Free to use in commercial and embedded products with no GPL contamination.
+Thanks for checking out this project — hopefully it proves useful.
 
+Every tool here is fully rewritten from scratch and fairly feature-complete, backed by extensive test files and scripts.
 
-## 2. Use Cases
+- **Single-file implementation**: every tool depends only on the standard C library. Copy a single `.c` file and compile — no dependencies to install.
+- **Pure C99**: follows ISO C99, with POSIX features declared explicitly through feature-test macros for maximum portability.
+- **Cross-platform abstraction**: per-source platform detection macros (Windows / Linux / macOS / *BSD) call the correct native API on each system.
+- **POSIX-style paths**: forward-slash output everywhere, UTF-8 encoding; Windows uses wide-character APIs for non-ANSI paths.
+- **Automated testing**: the build scripts embed 20~30+ regression tests covering major CLI options and edge cases.
+- **Performance first**: calls system APIs directly, avoids unnecessary abstraction layers; regex compile caching, dynamic strings, and other optimizations.
+- **MIT License**: free to use in commercial products and embedded projects, no GPL contamination.
 
-| Scenario          | Description                                                     |
-| ----------------- | --------------------------------------------------------------- |
-| Embedded Linux    | Small binaries (20-200KB), ideal for OpenWrt / Buildroot / Yocto |
-| Docker minimal image | Replace busybox in alpine, reduce image size                  |
-| Recovery environment | Use common commands in Live CD / PE without installation      |
-| Windows development | Unix-like CLI experience on Windows, no Cygwin/MSYS2 needed  |
-| Education         | Single-file implementation, clean code, great for learning systems programming and CLI development |
-| Cross-platform projects | Built-in toolset that doesn't depend on system-provided commands |
+## 2. Build
 
-```bash
-gcc -O2 -std=c99 -Wall -o ls ls.c     # One file, one command
-```
+One-click scripts at the repo root auto-discover every `.c` file under `src/` and compile each one into `build/`:
 
-No CMake, no autoconf, no pkg-config, no third-party libraries needed. The compiled binary has no dynamic library dependencies (statically linked against the standard C library only).
+| Platform             | Script         | Notes                        |
+| -------------------- | -------------- | ---------------------------- |
+| Linux / macOS / *BSD | `./build.sh`   | auto-detects gcc / cc / clang |
+| Windows              | `build.bat`    | requires MinGW-w64 etc.      |
 
-### 1. Pure C99 Standard
-
-Fully compliant with ISO C99 with no compiler extensions. System calls (file operations, terminal control, etc.) are declared via standard POSIX feature macros:
-
-```c
-#define _POSIX_C_SOURCE 200809L   // Linux / other Unix
-#define _DARWIN_C_SOURCE          // macOS
-#define _NETBSD_SOURCE            // NetBSD
-```
-
-This means the code compiles on any C99-conforming compiler — GCC, Clang, MSVC (with C99 mode), TCC, Open Watcom, etc.
-
-### 2. Truly Cross-Platform
-
-Each source file has built-in platform detection, calling the correct native API for each OS:
-
-| Platform | File Operation API                     | Terminal API       |
-| -------- | -------------------------------------- | ------------------ |
-| Windows  | `FindFirstFile` / `GetFileAttributes`  | Win32 Console API  |
-| Linux    | `opendir` / `lstat` / `d_type`        | `termios`          |
-| macOS    | `opendir` / `lstat` / `dirent`        | `termios`          |
-| *BSD     | `opendir` / `lstat`                   | `termios`          |
-
-No Cygwin/MSYS2 POSIX simulation — native API calls on each platform for better performance and compatibility.
-
-### 3. Small Footprint, Ideal for Embedded
-
-Each tool compiles to just **20KB~200KB**, making it perfect for:
-
-- Embedded Linux boards (OpenWrt, Buildroot)
-- Docker minimal images (scratch / alpine)
-- Recovery environments / Live CD
-- Restricted servers where installing software is inconvenient
-
-### 4. Build Scripts Double as Tests
-
-Each tool's `build.sh` / `build.bat` is not just a build script — it includes 20-30+ automated regression tests. Run the build script = compile + test in one step:
+Run with no arguments to compile every tool:
 
 ```bash
-./build.sh     # Compile + run all tests
-build.bat      # Same on Windows
+./build.sh     # compile everything
+build.bat      # same on Windows
 ```
 
+Output layout:
 
-## 3. Comparison with Alternatives
+```
+build/
+├── bash          # main shell (also produced as an sh alias)
+└── cmdtools/
+    ├── test      # also produced as a [ alias
+    ├── ls
+    └── ...
+```
 
-### vs System Built-in Tools
+### Options
 
-| Aspect          | This Project                      | GNU Coreutils / System Built-in    |
-| --------------- | --------------------------------- | ---------------------------------- |
-| Cross-platform  | Windows / Linux / macOS / *BSD    | Unix-like only (Windows needs Cygwin) |
-| Dependencies    | Zero, single file                 | Full runtime environment required  |
-| Size            | Single tool 20KB~200KB            | Coreutils bundle ~1MB+             |
-| Build           | `gcc -o ls ls.c` one line         | autotools / configure / make       |
-| Windows support | Native Win32 API                  | Requires MSYS2/Cygwin emulation    |
-| Customizability | Single source file, easy to trim  | Must understand complex build system |
+| Option                  | Description                                 | Example                                     |
+| ----------------------- | ------------------------------------------- | ------------------------------------------- |
+| `-s, --specify <tools>` | build only the given tools (comma- or space-separated) | `./build.sh -s bash,cat,ls`      |
+| `-cc <toolchain>`       | use a specific compiler name or a cross-compiler path | `./build.sh -cc arm-linux-gnueabihf-gcc` |
+| `-m32`                  | build 32-bit programs                       | `./build.sh -m32`                           |
+| `-v, --version`         | print version                               | `./build.sh -v`                             |
+| `-h, --help`            | print help                                  | `./build.sh -h`                             |
+
+- Without `-cc`, the script probes `gcc` → `cc` → `clang` on the system; if none is found it prints a message and exits.
+- Tools named in `--specify` that do not exist produce an `Unknown tool` warning and are skipped, without affecting the others.
+- Common standard libraries are already part of the link line (`-lm`, `-lrt`, `-lpthread`, Windows `psapi/advapi32/ws2_32`, ...), so no manual `-l...` flags are needed — even for cross builds.
+
+### Single-file build
+
+Every tool is a single file and can also be compiled standalone:
+
+```bash
+gcc -O2 -std=c99 -Wall -Wextra -o ls ls.c -lm
+```
+
+No CMake, no autoconf, no pkg-config, no third-party libraries. The resulting binary has no dynamic dependencies (pure static link against the standard C library).
+
+### Per-tool build scripts
+
+Each `src/<tool>/` directory ships its own `build.sh` / `build.bat`; running it compiles the tool and runs the full regression test suite:
+
+```bash
+cd src/awk && ./build.sh
+```
+
+## 3. Use Cases
+
+| Scenario               | Description                                                |
+| ---------------------- | ---------------------------------------------------------- |
+| Embedded Linux         | supports cross-compilation; small binary size; suits systems with incomplete toolkits |
+| Old systems            | great for older Linux / macOS systems with incomplete tools |
+| Minimal Docker images  | replace busyless-laden build stages and shrink images      |
+| Recovery environments  | common commands available on Live CD / PE without install  |
+| Windows development    | compile native Windows binaries; Unix-like CLI without Cygwin/MSYS2 |
+| Teaching / learning    | single-file implementation, clear code, ideal for studying systems programming |
+| Cross-platform projects| ship a built-in toolset that does not depend on system commands |
+
+## 4. Comparison
+
+### vs System Built-ins
+
+| Item          | This project                       | GNU Coreutils / Built-in     |
+| ------------- | ---------------------------------- | ---------------------------- |
+| Platforms     | Windows / Linux / macOS / *BSD     | Unix-like only (Cygwin on Windows) |
+| Dependencies  | zero, single-file                  | needs a full runtime        |
+| Size          | 20KB~200KB per tool                | Coreutils bundle ~1MB+       |
+| Build         | `gcc -o ls ls.c` in one line       | autotools / configure / make |
+| Windows       | native Win32 API                   | needs MSYS2/Cygwin layer     |
+| Customizing   | single-file source, easy to trim   | requires complex build system |
 
 ### vs BusyBox
 
-| Aspect          | This Project            | BusyBox                        |
-| --------------- | ----------------------- | ------------------------------ |
-| Implementation  | Pure C99                | C (with GNU extensions)        |
-| Build complexity| Single file compile     | Full build system (Kbuild)     |
-| Command style   | POSIX standard + extensions | Simplified (some GNU differences) |
-| Windows support | Native                  | None                           |
-| License         | MIT                     | GPL v2                         |
-| Use case        | Dev tools / desktop     | Embedded Linux / Alpine minimal|
+| Item          | This project          | BusyBox                     |
+| ------------- | --------------------- | --------------------------- |
+| Language      | pure C99              | C (heavy GNU extensions)    |
+| Build        | single-file compile    | full Kbuild system          |
+| Behavior      | POSIX + common extras  | trimmed (differs from GNU)  |
+| Windows       | native                | not supported               |
+| License       | MIT                   | GPL v2                      |
 
-### vs Other Single-File Implementations
+### vs Other single-file implementations
 
-| Aspect          | This Project                              | sbase (suckless) / heirloom |
-| --------------- | ----------------------------------------- | --------------------------- |
-| Platform support| Windows + Unix full platform              | Unix-like only              |
-| Windows native  | Yes (Win32 API)                           | No                          |
-| Build testing   | Built-in automated tests                  | Manual verification needed  |
-| Command coverage| ls/cp/mv/rm/find/sed/awk/bash etc. 12+    | ~20 basic commands          |
-| Documentation   | English + Chinese                         | English only                |
+| Item          | This project                    | sbase / heirloom             |
+| ------------- | ------------------------------- | ---------------------------- |
+| Platforms     | Windows + Linux + Unix          | Unix-like only               |
+| Native Windows| yes (Win32 API)                 | no                           |
+| Build & test  | built-in automated tests        | manual verification          |
+| Command set   | aims at a complete Linux toolkit| ~20 basic commands           |
 
+## 5. Supported Platforms
 
-## 4. Supported Platforms
+| Platform   | Compiler                | Feature macro                 |
+| ---------- | ----------------------- | ----------------------------- |
+| Windows    | GCC (MinGW / MSYS2 / TDM) | —                           |
+| Linux      | GCC                     | `_POSIX_C_SOURCE=200809L`     |
+| macOS      | GCC / Clang             | `_DARWIN_C_SOURCE`            |
+| FreeBSD    | Clang (`cc`)            | —                             |
+| OpenBSD    | Clang (`cc`)            | —                             |
+| NetBSD     | Clang (`cc`)            | `_NETBSD_SOURCE`              |
+| Other Unix | any C99 compiler        | —                             |
 
-| Platform   | Compiler                  | Feature Macro              |
-| ---------- | ------------------------- | -------------------------- |
-| Windows    | GCC (MinGW / MSYS2 / TDM) | —                          |
-| Linux      | GCC                       | `_POSIX_C_SOURCE=200809L`  |
-| macOS      | GCC / Clang               | `_DARWIN_C_SOURCE`         |
-| FreeBSD    | Clang (`cc`)              | —                          |
-| OpenBSD    | Clang (`cc`)              | —                          |
-| NetBSD     | Clang (`cc`)              | `_NETBSD_SOURCE`           |
-| Other Unix | Any C99 compiler          | —                          |
-
-
-## 5. License
+## 6. License
 
 The MIT License (MIT)
 
@@ -131,8 +137,8 @@ https://mit-license.org/
 
 Copyright © 2026 <Yezc/cclinuxtools>
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

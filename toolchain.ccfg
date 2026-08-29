@@ -1,9 +1,0 @@
-
-#config toolchain
-windows_toolchain  = gcc;
-linux_toolchain         = gcc;
-macos_toolchain      = gcc;
-freebsd_toolchain    = cc;
-openbsd_toolchain  = cc;
-netbsd_toolchain     = cc;
-other_systems          = gcc;
