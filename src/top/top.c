@@ -127,10 +127,14 @@
         #define _WIN32_WINNT 0x0600
     #endif
     #include <windows.h>
-    /* Ensure GetTickCount64 is declared (Vista+) */
-    #if !defined(GetTickCount64)
-    extern ULONGLONG WINAPI GetTickCount64(void);
-    #endif
+    /* GetTickCount64 only exists on Vista+ kernel32; importing it makes the
+     * loader refuse to start top.exe on Windows XP ("entry point not found").
+     * Fall back to GetTickCount(), present on every Windows version.  It is
+     * 32-bit and wraps every ~49.7 days, acceptable for uptime display.    */
+    static unsigned long long top_win_tick64(void)
+    {
+        return (unsigned long long)GetTickCount();
+    }
     #include <tlhelp32.h>
     #include <psapi.h>
     #include <conio.h>
@@ -623,7 +627,7 @@ static int _top_get_sys_info_windows(sys_info_t * info)
     }
 
     /* uptime */
-    info->uptime = (double)GetTickCount64() / 1000.0;
+    info->uptime = (double)top_win_tick64() / 1000.0;
 
     /* load average: not available on Windows */
     info->load1 = info->load5 = info->load15 = 0.0;
@@ -1692,7 +1696,7 @@ static void _top_sleep_ms(unsigned long ms)
 static unsigned long long _top_time_now_ms(void)
 {
 #ifdef TOP_PLATFORM_WINDOWS
-    return (unsigned long long)GetTickCount64();
+    return top_win_tick64();
 #else
     struct timeval tv;
     gettimeofday(&tv, NULL);

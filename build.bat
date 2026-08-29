@@ -47,7 +47,8 @@ set "PROJECT_VERSION=V1.0.0"
 set "CC="
 set "CFLAGS=-O2 -std=c99 -Wall -Wextra"
 set "LINK_LIBS=-lpsapi -ladvapi32 -lws2_32 -lnetapi32 -lm -lgdi32 -luser32 -lshell32 -lole32"
-set "M32_FLAG="
+set "M32_FLAG=-m32"
+set "STATIC_FLAG=-static"
 set "SPECIFY="
 
 set "SCRIPT_DIR=%~dp0"
@@ -66,6 +67,7 @@ set "FAIL_COUNT=0"
 if "%~1"=="" goto :parse_done
 if /i "%~1"=="-cc" goto :handle_cc
 if /i "%~1"=="-m32" goto :handle_m32
+if /i "%~1"=="-static" goto :handle_static
 if /i "%~1"=="-s" goto :handle_specify
 if /i "%~1"=="--specify" goto :handle_specify
 if /i "%~1"=="-v" goto :print_version
@@ -88,6 +90,11 @@ goto :parse_args
 
 :handle_m32
 set "M32_FLAG=-m32"
+shift
+goto :parse_args
+
+:handle_static
+set "STATIC_FLAG=-static"
 shift
 goto :parse_args
 
@@ -134,7 +141,7 @@ if not exist "%CMDTOOLS_DIR%" mkdir "%CMDTOOLS_DIR%"
 
 echo(
 echo   Compiler: %CC%
-echo   Flags   : %CFLAGS% %M32_FLAG%
+echo   Flags   : %CFLAGS% %M32_FLAG% %STATIC_FLAG%
 echo   Libs    : %LINK_LIBS%
 echo(
 
@@ -242,7 +249,8 @@ echo Usage: build.bat [options]
 echo Options:
 echo   (none)         compile all tools into build\
 echo   -cc ^<cc^>       use a specific compiler name or cross toolchain path
-echo   -m32           build 32-bit programs
+echo   -m32           32-bit build (default; keeps Windows XP support)
+echo   -static        statically linked build (default)
 echo   -s ^<tools^>     compile only the given tools, comma-separated (e.g. bash,cat,ls)
 echo   --specify ^<tools^>  same as -s
 echo   -v, --version   print version
@@ -304,14 +312,14 @@ set "_out=%~2"
 echo   CC %~nx2
 
 REM Link with common Windows system libraries (must follow the source file)
-"%CC%" %CFLAGS% %M32_FLAG% -o "%_out%" "%_src%" %LINK_LIBS% >nul 2>nul
+"%CC%" %CFLAGS% %M32_FLAG% %STATIC_FLAG% -o "%_out%" "%_src%" %LINK_LIBS% >nul 2>nul
 if %ERRORLEVEL% equ 0 (
     set /a PASS_COUNT+=1
     goto :eof
 )
 
 REM Link failed - retry without extra libs as last resort
-"%CC%" %CFLAGS% %M32_FLAG% -o "%_out%" "%_src%" >nul 2>nul
+"%CC%" %CFLAGS% %M32_FLAG% %STATIC_FLAG% -o "%_out%" "%_src%" >nul 2>nul
 if %ERRORLEVEL% equ 0 (
     set /a PASS_COUNT+=1
 ) else (

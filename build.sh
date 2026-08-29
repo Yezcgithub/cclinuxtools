@@ -47,6 +47,7 @@ PROJECT_VERSION="V1.0.0"
 CC=""
 CFLAGS="-O2 -std=c99 -Wall -Wextra"
 M32_FLAG=""
+STATIC_FLAG="-static"
 SPECIFY=""
 
 # Extra flags and libraries per platform, matching the per-tool build scripts.
@@ -58,7 +59,7 @@ case "$(uname -s)" in
     FreeBSD)   EXTRA_FLAGS=""; EXTRA_LIBS="-lm -lpthread" ;;
     OpenBSD)   EXTRA_FLAGS=""; EXTRA_LIBS="-lm -lpthread" ;;
     NetBSD)    EXTRA_FLAGS="-D_NETBSD_SOURCE"; EXTRA_LIBS="-lm -lpthread -lutil" ;;
-    MINGW*|MSYS*|CYGWIN*) EXTRA_FLAGS=""; EXTRA_LIBS="-lpsapi -ladvapi32 -lws2_32 -lnetapi32 -lm" ;;
+    MINGW*|MSYS*|CYGWIN*) EXTRA_FLAGS=""; M32_FLAG="-m32"; EXTRA_LIBS="-lpsapi -ladvapi32 -lws2_32 -lnetapi32 -lm" ;;
     *)         EXTRA_FLAGS=""; EXTRA_LIBS="-lm" ;;
 esac
 
@@ -94,7 +95,7 @@ all() {
 
     echo ""
     echo "  Compiler: $CC"
-    echo "  Flags   : $CFLAGS $EXTRA_FLAGS $M32_FLAG"
+    echo "  Flags   : $CFLAGS $EXTRA_FLAGS $M32_FLAG $STATIC_FLAG"
     echo "  Libs    : $EXTRA_LIBS"
     echo ""
 
@@ -204,7 +205,8 @@ help() {
     echo "Options:"
     echo "  (none)           compile all tools into build/"
     echo "  -cc <cc>         use a specific compiler name or cross toolchain path"
-    echo "  -m32             build 32-bit programs"
+    echo "  -m32             build 32-bit programs (default on Windows)"
+    echo "  -static          build statically linked programs"
     echo "  -s <tools>       compile only the given tools, comma-separated (e.g. bash,cat,ls)"
     echo "  --specify <tools> same as -s"
     echo "  -v, --version    print version"
@@ -227,17 +229,17 @@ compile_one() {
     local out_file="$2"
     local last_err=""
     echo "  CC $(basename "$out_file")"
-    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG -o "$out_file" "$src_file" $EXTRA_LIBS 2>&1); then
+    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG $STATIC_FLAG -o "$out_file" "$src_file" $EXTRA_LIBS 2>&1); then
         PASS_COUNT=$((PASS_COUNT + 1))
         return 0
     fi
     # Link failed - retry with -lm (awk needs libm on Linux)
-    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG -o "$out_file" "$src_file" -lm 2>&1); then
+    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG $STATIC_FLAG -o "$out_file" "$src_file" -lm 2>&1); then
         PASS_COUNT=$((PASS_COUNT + 1))
         return 0
     fi
     # Retry with common Windows system libraries (free/htop/top/id/hostname)
-    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG -o "$out_file" "$src_file" -lpsapi -ladvapi32 -lws2_32 -lnetapi32 2>&1); then
+    if last_err=$($CC $CFLAGS $EXTRA_FLAGS $M32_FLAG $STATIC_FLAG -o "$out_file" "$src_file" -lpsapi -ladvapi32 -lws2_32 -lnetapi32 2>&1); then
         PASS_COUNT=$((PASS_COUNT + 1))
         return 0
     fi
@@ -290,6 +292,10 @@ parse_args() {
                 ;;
             -m32)
                 M32_FLAG="-m32"
+                shift
+                ;;
+            -static)
+                STATIC_FLAG="-static"
                 shift
                 ;;
             -s|--specify)

@@ -3465,6 +3465,31 @@ static char *_bash_var_get(bash_ctx_t *ctx, const char *name, int *exported)
     return NULL;
 }
 
+#ifdef BASH_PLATFORM_WINDOWS
+/* _putenv_s("NAME", value) only exists on Vista+ msvcrt; on Windows XP the
+ * loader aborts before main() runs with "entry point not found in
+ * msvcrt.dll".  Rebuild the same effect with the legacy _putenv("NAME=value")
+ * which every Windows msvcrt provides, keeping the caller's contract. */
+static int _bash_crt_putenv(const char *name, const char *value)
+{
+    extern int __cdecl _putenv(const char *);
+    size_t nlen, vlen;
+    char *buf;
+    int rc;
+    if (!name || !*name) return -1;
+    nlen = strlen(name);
+    vlen = value ? strlen(value) : 0;
+    buf = (char *)malloc(nlen + vlen + 2);
+    if (!buf) return -1;
+    memcpy(buf, name, nlen);
+    buf[nlen] = '=';
+    memcpy(buf + nlen + 1, value ? value : "", vlen + 1);
+    rc = _putenv(buf);
+    /* msvcrt keeps its own copy of the buffer; deliberately not freed */
+    return rc;
+}
+#endif
+
 static int _bash_var_set(bash_ctx_t *ctx, const char *name, const char *value, int exported, int do_export, int readonly)
 {
     if (!name || !*name) return -1;
@@ -3490,9 +3515,8 @@ static int _bash_var_set(bash_ctx_t *ctx, const char *name, const char *value, i
                  * our internal UTF-8, so re-encode here.  (Names are
                  * always pure ASCII so we skip them in practice.)      */
 #ifdef BASH_PLATFORM_WINDOWS
-                extern int __cdecl _putenv_s(const char *, const char *);
                 char *pu = enc_utf8_to_sys(value ? value : "");
-                _putenv_s(name, pu ? pu : (value ? value : ""));
+                _bash_crt_putenv(name, pu ? pu : (value ? value : ""));
                 SetEnvironmentVariableA(name, pu ? pu : value);
                 enc_free(pu);
 #else
@@ -3512,9 +3536,8 @@ static int _bash_var_set(bash_ctx_t *ctx, const char *name, const char *value, i
     }
     if (exported) {
 #ifdef BASH_PLATFORM_WINDOWS
-        extern int __cdecl _putenv_s(const char *, const char *);
         char *pu2 = enc_utf8_to_sys(value ? value : "");
-        _putenv_s(name, pu2 ? pu2 : (value ? value : ""));
+        _bash_crt_putenv(name, pu2 ? pu2 : (value ? value : ""));
         SetEnvironmentVariableA(name, pu2 ? pu2 : value);
         enc_free(pu2);
 #else
@@ -3554,9 +3577,8 @@ static int _bash_var_set_local(bash_ctx_t *ctx, const char *name, const char *va
     _bash_vars_set(&ctx->frame->vars, name, value, exported, readonly);
             if (exported) {
 #ifdef BASH_PLATFORM_WINDOWS
-        extern int __cdecl _putenv_s(const char *, const char *);
         char *pu = enc_utf8_to_sys(value ? value : "");
-        _putenv_s(name, pu ? pu : (value ? value : ""));
+        _bash_crt_putenv(name, pu ? pu : (value ? value : ""));
         SetEnvironmentVariableA(name, pu ? pu : value);
         enc_free(pu);
 #else
@@ -5682,8 +5704,7 @@ static int bi_getopts(bash_ctx_t *ctx, int argc, char **argv)
         _bash_var_set(ctx, name, "?", 0, 0, 0);
         char buf[32]; snprintf(buf, sizeof(buf), "%d", optind + 1);
 #ifdef BASH_PLATFORM_WINDOWS
-        extern int __cdecl _putenv_s(const char *, const char *);
-        _putenv_s("OPTIND", buf); SetEnvironmentVariableA("OPTIND", buf);
+        _bash_crt_putenv("OPTIND", buf); SetEnvironmentVariableA("OPTIND", buf);
 #else
         setenv("OPTIND", buf, 1);
 #endif
@@ -5708,8 +5729,7 @@ static int bi_getopts(bash_ctx_t *ctx, int argc, char **argv)
     }
     char buf[32]; snprintf(buf, sizeof(buf), "%d", optind + 1);
 #ifdef BASH_PLATFORM_WINDOWS
-    extern int __cdecl _putenv_s(const char *, const char *);
-    _putenv_s("OPTIND", buf); SetEnvironmentVariableA("OPTIND", buf);
+    _bash_crt_putenv("OPTIND", buf); SetEnvironmentVariableA("OPTIND", buf);
 #else
     setenv("OPTIND", buf, 1);
 #endif
@@ -8833,9 +8853,8 @@ char **argv_u = NULL;
          * CRT side must be in HOST (not UTF-8) encoding. */
 #ifdef BASH_PLATFORM_WINDOWS
         {
-            extern int __cdecl _putenv_s(const char *, const char *);
             char *home_pu = enc_utf8_to_sys(home_u ? home_u : home_sys);
-            _putenv_s("HOME", home_pu ? home_pu : home_sys);
+            _bash_crt_putenv("HOME", home_pu ? home_pu : home_sys);
             enc_free(home_pu);
         }
 #endif
@@ -8956,7 +8975,7 @@ char **argv_u = NULL;
          *
          * We therefore use THREE complementary approaches to guarantee
          * PS1 is gone from every lookup path the shell actually uses:
-         *   (1) _putenv_s("PS1=") — sets CRT side to EMPTY STRING so that
+         *   (1) _putenv("PS1=") — sets CRT side to EMPTY STRING so that
          *       getenv("PS1") returns a non-null but *empty* string.  The
          *       shell then treats it as unset (it checks `ps1 && *ps1`).
          *       Also updates Win32 block on the CRT's behalf.
@@ -8970,16 +8989,12 @@ char **argv_u = NULL;
          *       even if the env were restored by some path the shell's
          *       variable tree still has none.                                */
 
-        /* (1) CRT-level clear via _putenv_s.  _putenv_s is declared in
-         * stdlib.h but under -std=c99 MinGW may hide it; since we can't
-         * easily redeclare we use the lower-level POSIX putenv if available,
-         * otherwise fall through to direct _environ manipulation below.    */
-        /* _CRTIMP errno_t __cdecl _putenv_s(const char*,const char*).
-         * We declare it manually here because MinGW hides this declaration
-         * under -std=c99 / __STRICT_ANSI__ even though the symbol still
-         * exists and is linkable.                                     */
-        extern int __cdecl _putenv_s(const char *_Name, const char *_Value);
-        _putenv_s("PS1", "");
+        /* (1) CRT-level clear.  We deliberately do NOT call _putenv_s()
+         * here: that entry point only exists on Vista+ msvcrt, so a build
+         * that imports it fails to load on Windows XP.  The legacy
+         * _putenv("PS1=") (via _bash_crt_putenv) gives the same empty
+         * string result and works on every Windows version.                */
+        _bash_crt_putenv("PS1", "");
         /* (3) Win32 block clear (for child processes we might launch) */
         SetEnvironmentVariableA("PS1", NULL);
         /* (4) Shell-variable-layer clear */

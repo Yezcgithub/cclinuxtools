@@ -162,7 +162,8 @@ build/
 | --- | --- | --- |
 | `-s, --specify <工具>` | 只编译指定工具，支持逗号或空格分隔多个 | `./build.sh -s bash,cat,ls` |
 | `-cc <工具链>` | 指定编译器名称或交叉编译工具链路径 | `./build.sh -cc arm-linux-gnueabihf-gcc` |
-| `-m32` | 编译成 32 位程序 | `./build.sh -m32` |
+| `-m32` | 编译成 32 位程序（Windows 下为默认，兼容 Windows XP） | `./build.sh -m32` |
+| `-static` | 编译成静态链接程序（默认） | `./build.sh -static` |
 | `-v, --version` | 打印版本 | `./build.sh -v` |
 | `-h, --help` | 打印帮助 | `./build.sh -h` |
 

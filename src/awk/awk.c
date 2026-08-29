@@ -4024,19 +4024,41 @@ static awk_val_t _awk_call_builtin(awk_eval_ctx_t *c, const char *name)
         struct tm tm; memset(&tm, 0, sizeof tm);
         tm.tm_year = Y - 1900; tm.tm_mon = Mo - 1; tm.tm_mday = D;
         tm.tm_hour = H; tm.tm_min = Mi; tm.tm_sec = S;
+time_t tt = (time_t)-1;
 #ifdef AWK_PLATFORM_WINDOWS
-        time_t tt = _mkgmtime(&tm);
+        /* MinGW-32's _mkgmtime() may fail to link (_mkgmtime32 missing in the
+         * 32-bit runtime) and _putenv_s (Vista+) is absent on Windows XP.
+         * Replicate timegm() with the TZ=UTC mktime trick, using the legacy
+         * _putenv()/_tzset() which XP's msvcrt exports. */
+        {
+            extern int __cdecl _putenv(const char *);
+            char *old_tz = getenv("TZ");
+            char *tz_save = old_tz ? _awk_xstrdup(old_tz) : NULL;
+            _putenv("TZ=UTC"); _tzset();
+            tt = mktime(&tm);
+            if (tz_save) {
+                size_t zl = strlen(tz_save);
+                char *zb = (char *)malloc(zl + 4);
+                if (zb) { memcpy(zb, "TZ=", 3); memcpy(zb + 3, tz_save, zl + 1); _putenv(zb); }
+            } else {
+                _putenv("TZ=");
+            }
+            free(tz_save);
+            _tzset();
+        }
 #else
         /* timegm() is a GNU/BSD extension not declared under strict
          * _POSIX_C_SOURCE.  Use the portable TZ-UTC mktime fallback. */
-        char *old_tz = getenv("TZ");
-        char *tz_save = old_tz ? _awk_xstrdup(old_tz) : NULL;
-        setenv("TZ", "UTC", 1);
-        tzset();
-        time_t tt = mktime(&tm);
-        if (tz_save) { setenv("TZ", tz_save, 1); free(tz_save); }
-        else          unsetenv("TZ");
-        tzset();
+        {
+            char *old_tz = getenv("TZ");
+            char *tz_save = old_tz ? _awk_xstrdup(old_tz) : NULL;
+            setenv("TZ", "UTC", 1);
+            tzset();
+            tt = mktime(&tm);
+            if (tz_save) { setenv("TZ", tz_save, 1); free(tz_save); }
+            else          unsetenv("TZ");
+            tzset();
+        }
 #endif
         _awk_v_set_n(&r, (double)tt);
     }

@@ -47,7 +47,8 @@ build/
 | ----------------------- | ------------------------------------------- | ------------------------------------------- |
 | `-s, --specify <tools>` | build only the given tools (comma- or space-separated) | `./build.sh -s bash,cat,ls`      |
 | `-cc <toolchain>`       | use a specific compiler name or a cross-compiler path | `./build.sh -cc arm-linux-gnueabihf-gcc` |
-| `-m32`                  | build 32-bit programs                       | `./build.sh -m32`                           |
+| `-m32` | build 32-bit programs (default on Windows; required for Windows XP) | `./build.sh -m32` |
+| `-static` | build statically linked programs (default) | `./build.sh -static` |
 | `-v, --version`         | print version                               | `./build.sh -v`                             |
 | `-h, --help`            | print help                                  | `./build.sh -h`                             |
 
